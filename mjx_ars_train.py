@@ -27,7 +27,6 @@ def save_checkpoint(path, theta, key, it, obs_dim, act_dim, meta=None, compresse
     dirpath = os.path.dirname(os.path.abspath(path))
     if dirpath:
         os.makedirs(dirpath, exist_ok=True)
-
     tmp_path = path + ".tmp"
     saver = np.savez_compressed if compressed else np.savez
     with open(tmp_path, "wb") as f:
@@ -49,7 +48,7 @@ def load_checkpoint(path):
         return None
     try:
         d = np.load(path, allow_pickle=True)
-        ckpt = {
+        return {
             "theta": jnp.array(d["theta"]),
             "obs_dim": int(d["obs_dim"]),
             "act_dim": int(d["act_dim"]),
@@ -57,9 +56,8 @@ def load_checkpoint(path):
             "key": jnp.array(d["key"]) if "key" in d.files else None,
             "meta": d["meta"].item() if "meta" in d.files else {},
         }
-        return ckpt
     except Exception as e:
-        print(f"Warning: Could not load checkpoint from {path}. Error: {e}")
+        print(f"Warning: Could not load checkpoint: {e}")
         return None
 
 # ==============================================================================
@@ -72,26 +70,32 @@ def make_mjx_env(xml_path: str, **kwargs):
 
     nu, nv, nq = int(m.nu), int(m.nv), int(m.nq)
 
+    # 액션 스케일링을 위한 파라미터
     ctrl_low = jnp.array(m.actuator_ctrlrange[:, 0], dtype=np.float32)
     ctrl_high = jnp.array(m.actuator_ctrlrange[:, 1], dtype=np.float32)
     ctrl_center = (ctrl_low + ctrl_high) / 2.0
     ctrl_half = (ctrl_high - ctrl_low) / 2.0
 
+    # JIT 컴파일을 위해 kwargs에서 파라미터를 추출하여 명시적 JAX 타입으로 변환
     action_repeat = int(kwargs.get('action_repeat', 3))
-    z_th = jnp.float32(kwargs.get('z_threshold', 0.28))
+    z_th = jnp.float32(kwargs.get('z_threshold', 0.32))
     ctrl_w = jnp.float32(kwargs.get('ctrl_cost_weight', 2e-4))
-    tilt_w = jnp.float32(kwargs.get('tilt_penalty_weight', 0.03))
+    tilt_w = jnp.float32(kwargs.get('tilt_penalty_weight', 3e-2))
     fwd_idx = {"x": 0, "y": 1, "z": 2}[kwargs.get('forward_axis', 'x')]
-    fwd_sign = jnp.float32(kwargs.get('forward_sign', 1))
+    fsign = jnp.float32(kwargs.get('forward_sign', 1))
     tgt_speed = jnp.float32(kwargs.get('target_speed', 0.35))
     over_w = jnp.float32(kwargs.get('overspeed_weight', 1.2))
-    speed_w = jnp.float32(kwargs.get('speed_weight', 0.0))
+    sp_w = jnp.float32(kwargs.get('speed_weight', 0.0))
     stand_b = jnp.float32(kwargs.get('stand_bonus', 0.20))
-    stand_w = jnp.float32(kwargs.get('stand_shape_weight', 1.2))
-    gate_z = jnp.float32(kwargs.get('stand_gate_z', 0.29))
-    gate_up = jnp.float32(kwargs.get('stand_gate_up', 0.80))
+    stand_w = jnp.float32(kwargs.get('stand_shape_weight', 1.20))
+    z_lo = jnp.float32(kwargs.get('target_z_low', 0.50))
+    z_hi = jnp.float32(kwargs.get('target_z_high', 0.60))
+    up_min = jnp.float32(kwargs.get('upright_min', 0.75))
     ang_w = jnp.float32(kwargs.get('angvel_penalty_weight', 0.01))
     actdw = jnp.float32(kwargs.get('act_delta_weight', 1e-4))
+    base_w = jnp.float32(kwargs.get('base_vel_penalty_weight', 0.02))
+    st_w = jnp.float32(kwargs.get('streak_weight', 0.01))
+    st_scale = jnp.float32(kwargs.get('streak_scale', 60.0))
 
     def scale_action(a_unit: jnp.ndarray) -> jnp.ndarray:
         return ctrl_center + ctrl_half * jnp.tanh(a_unit)
@@ -109,16 +113,27 @@ def make_mjx_env(xml_path: str, **kwargs):
         qpos = qpos0 + noise.at[:7].set(0.0)
         dd = replace(dd, qpos=qpos, qvel=zero_qvel, ctrl=zero_ctrl)
         obs = obs_from_dd(dd)
-        return (dd, obs, jnp.array(False, dtype=jnp.bool_), zero_ctrl), obs
+        # 상태에 'streak' 카운터 추가
+        streak0 = jnp.array(0.0, dtype=jnp.float32)
+        return (dd, obs, jnp.array(False, dtype=jnp.bool_), zero_ctrl, streak0), obs
 
+    # --- 보상 계산을 위한 헬퍼 함수 ---
     def upright_from_quat(q: jnp.ndarray) -> jnp.ndarray:
         return 1.0 - 2.0 * (q[1]**2 + q[2]**2)
 
     def sgate(x, t, k=30.0):
         return 1.0 / (1.0 + jnp.exp(-k * (x - t)))
 
+    def band_parabola(x, lo, hi):
+        span = jnp.maximum(hi - lo, 1e-6)
+        xn = jnp.clip((x - lo) / span, 0.0, 1.0)
+        return jnp.clip(1.0 - 4.0 * (xn - 0.5)**2, 0.0, 1.0)
+
+    def between_gate(x, lo, hi, k=30.0):
+        return sgate(x, lo, k) * sgate(hi, x, k)
+
     def step_single(state, a_unit: jnp.ndarray):
-        dd, _, done_prev, prev_ctrl = state
+        dd, _, done_prev, prev_ctrl, streak = state
         ctrl = scale_action(a_unit)
 
         def integrate_if_alive(dd_in):
@@ -130,42 +145,53 @@ def make_mjx_env(xml_path: str, **kwargs):
         dd = lax.cond(done_prev, lambda d: d, integrate_if_alive, dd)
         obs = obs_from_dd(dd)
 
-        forward_speed = (dd.qvel[fwd_idx] * fwd_sign).astype(jnp.float32)
+        # --- 보상 계산 시작 ---
         base_z = dd.qpos[2].astype(jnp.float32)
         up = jnp.clip(upright_from_quat(dd.qpos[3:7]), 0.0, 1.0)
+        forward_speed = (dd.qvel[fwd_idx] * fsign).astype(jnp.float32)
 
-        stand_gate = jnp.logical_and(base_z > gate_z, up > gate_up)
-        smooth_gate = sgate(base_z, gate_z) * sgate(up, gate_up)
+        # 보상 1: 목표 자세 유지 (Shaping)
+        z_band = band_parabola(base_z, z_lo, z_hi)
+        up_band = band_parabola(up, up_min, 0.98)
+        stand_shape = 0.5 * (z_band + up_band)
+        stand_gate_soft = between_gate(base_z, z_lo, z_hi) * sgate(up, up_min)
 
-        height_term = jnp.clip((base_z - 0.25) / (gate_z - 0.25 + 1e-6), 0.0, 1.0)
-        upright_term = jnp.clip((up - 0.6) / (gate_up - 0.6 + 1e-6), 0.0, 1.0)
-        stand_shape = 0.5 * (height_term + upright_term)
-
+        # 보상 2: 속도 (speed_weight로 켜고 끌 수 있음)
         reward_forward = jnp.minimum(forward_speed, tgt_speed)
         overspeed = jnp.maximum(forward_speed - tgt_speed, 0.0)
-        overspeed_pen = over_w * (overspeed ** 2)
-        speed_term = speed_w * smooth_gate * (reward_forward - overspeed_pen)
+        speed_term = sp_w * stand_gate_soft * (reward_forward - over_w * (overspeed**2))
 
+        # 보상 3: 오래 서 있기 (Streak Bonus)
+        is_standing_now = (stand_gate_soft > 0.6) & (~done_prev)
+        streak_next = jnp.where(is_standing_now, streak + 1.0, 0.0)
+        streak_reward = st_w * jnp.tanh(streak_next / st_scale)
+
+        # 패널티: 흔들림 억제
         ctrl_cost = ctrl_w * jnp.sum(jnp.square(ctrl))
         tilt_pen = tilt_w * (1.0 - up)
         ang_pen = ang_w * jnp.sum(jnp.square(dd.qvel[3:5].astype(jnp.float32)))
+        base_lin_pen = jnp.sum(jnp.square(dd.qvel[0:2].astype(jnp.float32)))
+        base_ang_pen = jnp.sum(jnp.square(dd.qvel[5].astype(jnp.float32))) # yaw 각속도만
+        base_pen = base_w * (base_lin_pen + base_ang_pen)
         act_pen = actdw * jnp.sum(jnp.square(ctrl - prev_ctrl))
 
+        # 최종 보상 조합
         reward = (stand_b
                   + stand_w * stand_shape
+                  + streak_reward
                   + speed_term
-                  - (tilt_pen + ang_pen + act_pen + ctrl_cost))
+                  - (tilt_pen + ang_pen + base_pen + act_pen + ctrl_cost))
 
+        # 종료 조건
         isnan = jnp.any(jnp.isnan(dd.qpos)) | jnp.any(jnp.isnan(dd.qvel))
         done_now = jnp.logical_or(isnan, jnp.logical_or(base_z < z_th, up < 0.2))
         done = jnp.logical_or(done_prev, done_now)
 
-        new_state = (dd, obs, done, ctrl)
+        new_state = (dd, obs, done, ctrl, streak_next)
         return new_state, (obs, reward, done)
 
     reset_batch = jax.jit(jax.vmap(reset_single))
     step_batch = jax.jit(jax.vmap(step_single))
-
     env_info = {"obs_dim": int(nq - 7 + nv), "act_dim": int(nu)}
     return reset_batch, step_batch, env_info
 
@@ -176,30 +202,26 @@ def make_policy_fns(obs_dim: int, act_dim: int) -> Tuple[Callable, Callable]:
     params_pytree_shape = (jnp.zeros((obs_dim, act_dim)), jnp.zeros((act_dim,)))
     def ravel_pytree_partial(pytree): return ravel_pytree(pytree)[0]
     _, unravel_fn = ravel_pytree(params_pytree_shape)
-
     @jax.jit
     def policy_apply_fn(theta: jnp.ndarray, obs: jnp.ndarray) -> jnp.ndarray:
         W, b = unravel_fn(theta)
         return jnp.tanh(obs @ W + b)
-
     return ravel_pytree_partial, policy_apply_fn
 
 def ars_train(xml_path: str, **kwargs):
     seed, num_envs, episode_length = kwargs['seed'], kwargs['num_envs'], kwargs['episode_length']
-
-    steps_per_iter = (2 * kwargs["num_dirs"] * num_envs *
-                      episode_length * kwargs["action_repeat"])
+    steps_per_iter = (2 * kwargs["num_dirs"] * num_envs * episode_length * kwargs["action_repeat"])
     print(f"[Config] steps/iter ≈ {steps_per_iter:,}  | dir_chunk={kwargs.get('dir_chunk')}")
 
     env_params_keys = [
         'action_repeat','z_threshold','ctrl_cost_weight','tilt_penalty_weight',
         'forward_axis','forward_sign','target_speed','overspeed_weight',
         'stand_bonus','stand_shape_weight','speed_weight',
-        'stand_gate_z','stand_gate_up','angvel_penalty_weight','act_delta_weight'
+        'target_z_low','target_z_high','upright_min',
+        'angvel_penalty_weight','act_delta_weight','base_vel_penalty_weight',
+        'streak_weight','streak_scale'
     ]
-    reset_batch, step_batch, info = make_mjx_env(
-        xml_path=xml_path, **{k: kwargs[k] for k in env_params_keys}
-    )
+    reset_batch, step_batch, info = make_mjx_env(xml_path=xml_path, **{k: kwargs[k] for k in env_params_keys})
     obs_dim, act_dim = info["obs_dim"], info["act_dim"]
 
     key = random.PRNGKey(seed)
@@ -214,10 +236,10 @@ def ars_train(xml_path: str, **kwargs):
         ckpt = load_checkpoint(kwargs["save_path"])
         if ckpt is not None:
             if ckpt["obs_dim"] != obs_dim or ckpt["act_dim"] != act_dim:
-                raise ValueError(f"Checkpoint dim mismatch: ckpt({ckpt['obs_dim']},{ckpt['act_dim']}) vs model({obs_dim},{act_dim})")
+                raise ValueError("Checkpoint dim mismatch")
             theta, start_it = ckpt["theta"], ckpt["iter"]
             if ckpt["key"] is not None: key = ckpt["key"]
-            print(f"[Resume] Loaded checkpoint from {kwargs['save_path']} at iter {start_it}")
+            print(f"[Resume] Loaded checkpoint at iter {start_it}")
 
     @jax.jit
     def rollout_return(theta_: jnp.ndarray, keys: jnp.ndarray) -> jnp.ndarray:
@@ -227,9 +249,7 @@ def ars_train(xml_path: str, **kwargs):
             act = policy_apply(theta_, ob)
             st, (ob_next, r, done) = step_batch(st, act)
             return (st, ob_next, ret + r * (1.0 - done)), None
-        (_, _, returns), _ = lax.scan(
-            body, (state, obs, jnp.zeros(num_envs, dtype=jnp.float32)), None, length=episode_length
-        )
+        (_, _, returns), _ = lax.scan(body, (state, obs, jnp.zeros(num_envs, dtype=jnp.float32)), None, length=episode_length)
         return returns
 
     @jax.jit
@@ -239,23 +259,16 @@ def ars_train(xml_path: str, **kwargs):
             st, ob, ret, sum_up, sum_z, alive_steps = carry
             dd = st[0]
             qpos = dd.qpos
-            # [버그 수정] 모든 환경에 대해 올바르게 인덱싱 (예: qpos[2] -> qpos[:, 2])
             z = qpos[:, 2].astype(jnp.float32)
-            up = jnp.clip(1.0 - 2.0 * (qpos[:, 4]**2 + qpos[:, 5]**2), 0.0, 1.0)
-
+            q = qpos[:, 3:7]
+            up = jnp.clip(1.0 - 2.0 * (q[:, 1]**2 + q[:, 2]**2), 0.0, 1.0)
             act = policy_apply(theta_, ob)
             st2, (ob_next, r, done) = step_batch(st, act)
             is_alive = (1.0 - done)
-
-            return (st2, ob_next,
-                    ret + r * is_alive,
-                    sum_up + up * is_alive,
-                    sum_z + z * is_alive,
-                    alive_steps + is_alive), None
-
+            return (st2, ob_next, ret + r*is_alive, sum_up + up*is_alive, sum_z + z*is_alive, alive_steps + is_alive), None
+        
         init = (state, obs, *[jnp.zeros(num_envs, jnp.float32) for _ in range(4)])
         (_, _, returns, sum_up, sum_z, alive_steps), _ = lax.scan(body, init, None, length=episode_length)
-        
         total_alive_steps = jnp.maximum(jnp.sum(alive_steps), 1.0)
         mean_up = jnp.sum(sum_up) / total_alive_steps
         mean_z  = jnp.sum(sum_z)  / total_alive_steps
@@ -298,8 +311,7 @@ def ars_train(xml_path: str, **kwargs):
         topk_idx = jnp.argsort(scores)[-kwargs["top_dirs"]:]
         R_plus_top, R_minus_top, deltas_top = R_plus[topk_idx], R_minus[topk_idx], deltas[topk_idx]
         reward_std = jnp.std(jnp.concatenate([R_plus_top, R_minus_top])) + 1e-8
-        weighted = (R_plus_top - R_minus_top)[:, None] * deltas_top
-        grad_est = jnp.mean(weighted, axis=0) / reward_std
+        grad_est = jnp.mean((R_plus_top - R_minus_top)[:, None] * deltas_top, axis=0) / reward_std
         theta += kwargs["step_size"] * grad_est
 
         pbar.set_postfix({
@@ -318,8 +330,7 @@ def ars_train(xml_path: str, **kwargs):
         if (global_it + 1) % ckpt_every == 0 or it_local == total_new_iters - 1:
             save_checkpoint(
                 kwargs["save_path"], theta=theta, key=key, it=global_it + 1,
-                obs_dim=obs_dim, act_dim=act_dim,
-                meta={k: kwargs.get(k) for k in env_params_keys + ["xml_path"]},
+                obs_dim=obs_dim, act_dim=act_dim, meta={k: kwargs.get(k) for k in env_params_keys + ["xml_path"]},
             )
 
 # ==============================================================================
@@ -328,10 +339,11 @@ def ars_train(xml_path: str, **kwargs):
 def run_inference(xml_path: str, ckpt_path: str, **kwargs):
     ckpt = load_checkpoint(ckpt_path)
     if ckpt is None:
-        raise FileNotFoundError(f"Checkpoint not found at {ckpt_path}")
+        raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
     theta, obs_dim, act_dim = ckpt["theta"], ckpt["obs_dim"], ckpt["act_dim"]
     _, policy_apply = make_policy_fns(obs_dim, act_dim)
 
+    # kwargs에 체크포인트의 메타 정보가 있다면 우선 사용
     if ckpt.get("meta"):
         for k, v in ckpt["meta"].items():
             kwargs.setdefault(k, v)
@@ -340,10 +352,11 @@ def run_inference(xml_path: str, ckpt_path: str, **kwargs):
         'action_repeat','z_threshold','ctrl_cost_weight','tilt_penalty_weight',
         'forward_axis','forward_sign','target_speed','overspeed_weight',
         'stand_bonus','stand_shape_weight','speed_weight',
-        'stand_gate_z','stand_gate_up','angvel_penalty_weight','act_delta_weight'
+        'target_z_low','target_z_high','upright_min',
+        'angvel_penalty_weight','act_delta_weight','base_vel_penalty_weight',
+        'streak_weight','streak_scale'
     ]
-    env_params = {k: kwargs[k] for k in env_params_keys}
-    reset_batch, step_batch, _ = make_mjx_env(xml_path=xml_path, **env_params)
+    reset_batch, step_batch, _ = make_mjx_env(xml_path=xml_path, **{k: kwargs[k] for k in env_params_keys})
 
     num_envs = kwargs['num_envs']
     episode_length = kwargs['episode_length']
@@ -356,14 +369,14 @@ def run_inference(xml_path: str, ckpt_path: str, **kwargs):
             st, ob, ret, sum_up, sum_z, alive_steps = carry
             dd = st[0]
             qpos = dd.qpos
-            # [버그 수정] 모든 환경에 대해 올바르게 인덱싱
             z = qpos[:, 2].astype(jnp.float32)
-            up = jnp.clip(1.0 - 2.0 * (qpos[:, 4]**2 + qpos[:, 5]**2), 0.0, 1.0)
+            q = qpos[:, 3:7]
+            up = jnp.clip(1.0 - 2.0 * (q[:, 1]**2 + q[:, 2]**2), 0.0, 1.0)
             act = policy_apply(theta_, ob)
             st2, (ob_next, r, done) = step_batch(st, act)
             is_alive = (1.0 - done)
             return (st2, ob_next, ret + r*is_alive, sum_up + up*is_alive, sum_z + z*is_alive, alive_steps + is_alive), None
-
+        
         init = (state, obs, *[jnp.zeros(num_envs, jnp.float32) for _ in range(4)])
         (_, _, returns, sum_up, sum_z, alive_steps), _ = lax.scan(body, init, None, length=episode_length)
         total_alive_steps = jnp.maximum(jnp.sum(alive_steps), 1.0)
@@ -378,34 +391,43 @@ def run_inference(xml_path: str, ckpt_path: str, **kwargs):
 # 4. 스크립트 실행 메인 블록
 # ==============================================================================
 def parse_args():
-    p = argparse.ArgumentParser(description="Headless-only MJX + ARS trainer for quadruped")
+    p = argparse.ArgumentParser(description="Headless-only MJX + ARS trainer for quadruped (crouch-stand first)")
+    # --- 기본 설정 ---
     p.add_argument("--xml", type=str, required=True, dest="xml_path")
-    p.add_argument("--infer", action="store_true", help="추론 모드로 실행")
-    p.add_argument("--resume", action="store_true", help="저장된 체크포인트에서 학습 재개")
+    p.add_argument("--infer", action="store_true")
+    p.add_argument("--resume", action="store_true")
     p.add_argument("--seed", type=int, default=0)
+    # --- 학습 파라미터 ---
     p.add_argument("--num-envs", type=int, default=128)
     p.add_argument("--num-dirs", type=int, default=16)
     p.add_argument("--top-dirs", type=int, default=8)
     p.add_argument("--episode-length", type=int, default=300)
     p.add_argument("--action-repeat", type=int, default=3)
-    p.add_argument("--iterations", type=int, default=500)
-    p.add_argument("--dir-chunk", type=int, default=16, help="메모리 관리를 위한 num_dirs 분할 크기")
+    p.add_argument("--iterations", type=int, default=1000)
+    p.add_argument("--dir-chunk", type=int, default=8)
     p.add_argument("--step-size", type=float, default=0.010)
     p.add_argument("--noise-std", type=float, default=0.015)
-    p.add_argument("--z-threshold", type=float, default=0.28)
+    # --- 환경 및 보상 파라미터 (안정적 서기 중점) ---
+    p.add_argument("--z-threshold", type=float, default=0.32, help="에피소드 종료 높이")
     p.add_argument("--ctrl-cost-weight", type=float, default=2e-4)
+    p.add_argument("--tilt-penalty-weight", type=float, default=3e-2)
+    p.add_argument("--stand-bonus", type=float, default=0.20)
+    p.add_argument("--stand-shape-weight", type=float, default=1.20)
+    p.add_argument("--speed-weight", type=float, default=0.0, help="속도 보상 가중치 (0으로 두면 서기만 학습)")
+    p.add_argument("--target-z-low", type=float, default=0.50, help="목표 높이 구간 (최소)")
+    p.add_argument("--target-z-high", type=float, default=0.60, help="목표 높이 구간 (최대)")
+    p.add_argument("--upright-min", type=float, default=0.75, help="최소 upright 자세")
+    p.add_argument("--angvel-penalty-weight", type=float, default=0.01)
+    p.add_argument("--act-delta-weight", type=float, default=1e-4)
+    p.add_argument("--base-vel-penalty-weight", type=float, default=0.02)
+    p.add_argument("--streak-weight", type=float, default=0.01)
+    p.add_argument("--streak-scale", type=float, default=60.0)
+    # --- (참고용) 속도 관련 파라미터 ---
     p.add_argument("--forward-axis", choices=["x", "y", "z"], default="x")
     p.add_argument("--forward-sign", type=int, choices=[-1, 1], default=1)
     p.add_argument("--target-speed", type=float, default=0.35)
     p.add_argument("--overspeed-weight", type=float, default=1.2)
-    p.add_argument("--stand-bonus", type=float, default=0.20)
-    p.add_argument("--stand-shape-weight", type=float, default=1.2)
-    p.add_argument("--speed-weight", type=float, default=0.0, help="속도 보상 가중치 (서기 학습 단계는 0 권장)")
-    p.add_argument("--stand-gate-z", type=float, default=0.29)
-    p.add_argument("--stand-gate-up", type=float, default=0.80)
-    p.add_argument("--tilt-penalty-weight", type=float, default=0.03)
-    p.add_argument("--angvel-penalty-weight", type=float, default=0.01)
-    p.add_argument("--act-delta-weight", type=float, default=1e-4)
+    # --- 로깅 및 저장 ---
     p.add_argument("--eval-every", type=int, default=10)
     p.add_argument("--ckpt-every", type=int, default=10)
     p.add_argument("--save-path", type=str, default="ars_policy.npz")
@@ -413,7 +435,6 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
-
     if args.infer:
         kwargs = vars(args).copy()
         xml = kwargs.pop("xml_path")
@@ -422,3 +443,4 @@ if __name__ == "__main__":
         run_inference(xml_path=xml, ckpt_path=ckpt, **kwargs)
     else:
         ars_train(**vars(args))
+
