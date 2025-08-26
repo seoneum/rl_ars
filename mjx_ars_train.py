@@ -12,7 +12,6 @@ import argparse
 import time
 from dataclasses import replace
 from typing import Tuple, Any, Callable
-from functools import partial
 
 import numpy as np
 import jax
@@ -26,23 +25,25 @@ from mujoco import mjx
 # ==============================================================================
 # 체크포인트 유틸리티 함수
 # ==============================================================================
-def save_checkpoint(path, theta, key, it, obs_dim, act_dim, meta=None):
+def save_checkpoint(path, theta, key, it, obs_dim, act_dim, meta=None, compressed=False):
     """학습 상태를 안전하게 저장합니다 (임시 파일 및 디렉토리 생성)."""
-    save_dir = os.path.dirname(path)
-    if save_dir:
-        os.makedirs(save_dir, exist_ok=True)
-        
+    dirpath = os.path.dirname(os.path.abspath(path))
+    if dirpath:
+        os.makedirs(dirpath, exist_ok=True)
+
     tmp_path = path + ".tmp"
-    np.savez(
-        tmp_path,
-        theta=np.array(theta, dtype=np.float32),
-        key=np.array(key, dtype=np.uint32),
-        iter=np.int64(it),
-        obs_dim=np.int32(obs_dim),
-        act_dim=np.int32(act_dim),
-        meta=np.array(meta or {}, dtype=object),
-        version=np.int32(1),
-    )
+    saver = np.savez_compressed if compressed else np.savez
+    with open(tmp_path, "wb") as f:
+        saver(
+            f,
+            theta=np.asarray(theta, dtype=np.float32),
+            key=np.asarray(key, dtype=np.uint32),
+            iter=np.int64(it),
+            obs_dim=np.int32(obs_dim),
+            act_dim=np.int32(act_dim),
+            meta=np.asarray(meta or {}, dtype=object),
+            version=np.int32(1),
+        )
     os.replace(tmp_path, path)
 
 def load_checkpoint(path):
@@ -65,7 +66,7 @@ def load_checkpoint(path):
         return None
 
 # ==============================================================================
-# 1. MJX 기반 병렬 시뮬레이션 환경 생성 (인덱스 버그 수정)
+# 1. MJX 기반 병렬 시뮬레이션 환경 생성
 # ==============================================================================
 def make_mjx_env(xml_path: str,
                  action_repeat: int = 4,
@@ -73,7 +74,11 @@ def make_mjx_env(xml_path: str,
                  ctrl_cost_weight: float = 1e-3,
                  alive_bonus: float = 0.05,
                  contact_penalty_weight: float = 2e-3,
-                 tilt_penalty_weight: float = 1e-3
+                 tilt_penalty_weight: float = 1e-3,
+                 forward_axis: str = "x",
+                 forward_sign: int = 1,
+                 target_speed: float = 0.8,
+                 overspeed_weight: float = 0.5
                  ):
     m = mujoco.MjModel.from_xml_path(xml_path)
     mm = mjx.put_model(m)
@@ -104,6 +109,12 @@ def make_mjx_env(xml_path: str,
     zero_qvel = jnp.zeros((m.nv,), dtype=jnp.float32)
     zero_ctrl = jnp.zeros((m.nu,), dtype=jnp.float32)
 
+    axis2idx = {"x": 0, "y": 1, "z": 2}
+    fwd_idx = axis2idx[forward_axis]
+    fwd_sign = jnp.float32(forward_sign)
+    tgt_speed = jnp.float32(target_speed)
+    over_w = jnp.float32(overspeed_weight)
+
     def reset_single(key: jax.Array) -> Tuple[Tuple[Any, ...], jnp.ndarray]:
         dd = mjx.make_data(mm)
         noise = 0.01 * random.normal(key, (qpos0.shape[0],), dtype=jnp.float32)
@@ -126,29 +137,27 @@ def make_mjx_env(xml_path: str,
 
         obs = obs_from_dd(dd)
         
-        # ▼▼▼ [버그 수정] 올바른 인덱스로 전진 속도(vx) 참조 ▼▼▼
-        vx = dd.qvel[0].astype(jnp.float32)
+        forward_speed = (dd.qvel[fwd_idx] * fwd_sign).astype(jnp.float32)
+        reward_forward = jnp.minimum(forward_speed, tgt_speed)
+        overspeed = jnp.maximum(forward_speed - tgt_speed, 0.0)
+        overspeed_pen = over_w * (overspeed ** 2)
         ctrl_cost = ctrl_cost_weight * jnp.sum(jnp.square(ctrl))
-        base_reward = alive_bonus + vx - ctrl_cost
-
+        
         contact = dd._impl.contact
         g1, g2 = contact.geom1, contact.geom2
         ids = non_foot_geom_ids_jnp
         is_nonfoot = ((g1[:, None] == ids[None, :]).any(axis=1) | 
                       (g2[:, None] == ids[None, :]).any(axis=1))
         is_ground = (g1 == ground_id) | (g2 == ground_id)
-        # ▼▼▼ [버그 수정] DeprecationWarning 해결 ▼▼▼
         valid = jnp.arange(g1.shape[0], dtype=jnp.int32) < dd._impl.ncon
         num_bad_contacts = jnp.sum(is_nonfoot & is_ground & valid)
         contact_penalty = contact_penalty_weight * num_bad_contacts.astype(jnp.float32)
         
-        # ▼▼▼ [버그 수정] 올바른 인덱스로 각속도(roll/pitch) 참조 ▼▼▼
         torso_angular_velocity = dd.qvel[3:5]
         tilt_penalty = tilt_penalty_weight * jnp.sum(jnp.square(torso_angular_velocity))
 
-        reward = base_reward - contact_penalty - tilt_penalty
+        reward = alive_bonus + reward_forward - overspeed_pen - ctrl_cost - contact_penalty - tilt_penalty
         
-        # ▼▼▼ [버그 수정] 올바른 인덱스로 Z축 높이 참조 ▼▼▼
         z = dd.qpos[2]
         isnan = jnp.any(jnp.isnan(dd.qpos)) | jnp.any(jnp.isnan(dd.qvel))
         done_now = jnp.logical_or(isnan, z < z_threshold)
@@ -180,8 +189,9 @@ def ars_train(xml_path: str, **kwargs):
     seed, num_envs, episode_length = kwargs['seed'], kwargs['num_envs'], kwargs['episode_length']
     reset_batch, step_batch, info = make_mjx_env(
         xml_path=xml_path, 
-        **{k: kwargs[k] for k in ['action_repeat', 'z_threshold', 'ctrl_cost_weight', 
-                                  'alive_bonus', 'contact_penalty_weight', 'tilt_penalty_weight']}
+        **{k: kwargs[k] for k in ['action_repeat', 'z_threshold', 'ctrl_cost_weight', 'alive_bonus',
+                                  'contact_penalty_weight', 'tilt_penalty_weight', 'forward_axis', 
+                                  'forward_sign', 'target_speed', 'overspeed_weight']}
     )
     obs_dim, act_dim = info["obs_dim"], info["act_dim"]
     key = random.PRNGKey(seed)
@@ -211,13 +221,17 @@ def ars_train(xml_path: str, **kwargs):
         (_, _, returns), _ = lax.scan(body, (state, obs, jnp.zeros(num_envs)), None, length=episode_length)
         return returns
 
-    @jax.jit
-    def eval_dir_batch(theta_b, deltas_b, keys_b, noise_std_b):
-        def eval_one(delta, keys):
-            r_plus = rollout_return(theta_b + noise_std_b * delta, keys).mean()
-            r_minus = rollout_return(theta_b - noise_std_b * delta, keys).mean()
-            return r_plus, r_minus
-        return jax.vmap(eval_one)(deltas_b, keys_b)
+    def make_eval_chunk_fn(rollout_return_fn, noise_std):
+        @jax.jit
+        def eval_chunk(theta_, deltas_chunk, keys_chunk):
+            def eval_one(delta, keys):
+                r_plus = rollout_return_fn(theta_ + noise_std * delta, keys).mean()
+                r_minus = rollout_return_fn(theta_ - noise_std * delta, keys).mean()
+                return r_plus, r_minus
+            return jax.vmap(eval_one)(deltas_chunk, keys_chunk)
+        return eval_chunk
+
+    eval_chunk = make_eval_chunk_fn(rollout_return, kwargs["noise_std"])
 
     total_new_iters = kwargs["iterations"]
     ckpt_every = kwargs["ckpt_every"] or kwargs["eval_every"]
@@ -228,17 +242,18 @@ def ars_train(xml_path: str, **kwargs):
         deltas = random.normal(k_delta, (kwargs["num_dirs"], theta.shape[0]))
         base_keys = random.split(k_dirs, kwargs["num_dirs"] * num_envs).reshape(kwargs["num_dirs"], num_envs, 2)
         
-        R_plus_parts, R_minus_parts = [], []
-        batch_size = kwargs["dir_batch"]
-        for s in range(0, kwargs["num_dirs"], batch_size):
-            e = min(s + batch_size, kwargs["num_dirs"])
-            rp_b, rm_b = eval_dir_batch(theta, deltas[s:e], base_keys[s:e], kwargs["noise_std"])
-            rp_b, rm_b = jax.device_get((rp_b, rm_b))
-            R_plus_parts.append(rp_b)
-            R_minus_parts.append(rm_b)
-        
-        R_plus = jnp.asarray(np.concatenate(R_plus_parts))
-        R_minus = jnp.asarray(np.concatenate(R_minus_parts))
+        dir_chunk = kwargs.get("dir_chunk")
+        if dir_chunk is None:
+            # jit 함수를 직접 호출하기 위해 eval_chunk 사용
+            R_plus, R_minus = eval_chunk(theta, deltas, base_keys)
+        else:
+            R_plus_list, R_minus_list = [], []
+            for s in range(0, kwargs["num_dirs"], dir_chunk):
+                e = min(s + dir_chunk, kwargs["num_dirs"])
+                r_p, r_m = eval_chunk(theta, deltas[s:e], base_keys[s:e])
+                R_plus_list.append(r_p); R_minus_list.append(r_m)
+            R_plus = jnp.concatenate(R_plus_list, axis=0)
+            R_minus = jnp.concatenate(R_minus_list, axis=0)
         
         scores = jnp.maximum(R_plus, R_minus)
         topk_idx = jnp.argsort(scores)[-kwargs["top_dirs"]:]
@@ -258,78 +273,49 @@ def ars_train(xml_path: str, **kwargs):
         if (global_it + 1) % ckpt_every == 0 or it_local == total_new_iters - 1:
             save_checkpoint(
                 kwargs["save_path"], theta=theta, key=key, it=global_it + 1,
-                obs_dim=obs_dim, act_dim=act_dim, meta={"xml_path": xml_path},
+                obs_dim=obs_dim, act_dim=act_dim, 
+                meta={k: kwargs.get(k) for k in ["xml_path", "forward_axis", "forward_sign", "target_speed", "overspeed_weight"]},
             )
 
 # ==============================================================================
 # 3. 추론 및 시각화
 # ==============================================================================
-def run_inference(xml_path: str, ckpt_path: str, num_envs: int, episode_length: int, action_repeat: int, seed: int):
+def run_inference(xml_path: str, ckpt_path: str, **kwargs):
     ckpt = load_checkpoint(ckpt_path)
     if ckpt is None: raise FileNotFoundError(f"Checkpoint not found at {ckpt_path}")
     theta, obs_dim, act_dim = ckpt["theta"], ckpt["obs_dim"], ckpt["act_dim"]
     _, policy_apply = make_policy_fns(obs_dim, act_dim)
-    reset_batch, step_batch, _ = make_mjx_env(xml_path=xml_path, action_repeat=action_repeat)
-    keys = random.split(random.PRNGKey(seed), num_envs)
+    
+    env_params = {k: kwargs[k] for k in ['action_repeat', 'z_threshold', 'ctrl_cost_weight', 'alive_bonus',
+                                         'contact_penalty_weight', 'tilt_penalty_weight', 'forward_axis', 
+                                         'forward_sign', 'target_speed', 'overspeed_weight']}
+    reset_batch, step_batch, _ = make_mjx_env(xml_path=xml_path, **env_params)
+    
+    keys = random.split(random.PRNGKey(kwargs['seed']), kwargs['num_envs'])
     state, obs = reset_batch(keys)
     def body(carry, _):
         st, ob, ret = carry
         act = policy_apply(theta, ob)
         st, (ob_next, r, done) = step_batch(st, act)
         return (st, ob_next, ret + r * (1.0 - done)), None
-    (_, _, returns), _ = lax.scan(body, (state, obs, jnp.zeros(num_envs)), None, length=episode_length)
+    (_, _, returns), _ = lax.scan(body, (state, obs, jnp.zeros(kwargs['num_envs'], dtype=jnp.float32)), None, length=kwargs['episode_length'])
     print(f"Inference mean return: {float(jnp.mean(returns)):.2f}")
 
 def run_viewer(xml_path: str, ckpt_path: str, action_repeat: int):
+    try:
+        from mujoco import viewer as mj_viewer
+    except Exception as e:
+        raise RuntimeError("MuJoCo viewer 모듈을 찾을 수 없습니다. 'pip install -U mujoco glfw' 후 재시도하세요.") from e
+
     ckpt = load_checkpoint(ckpt_path)
     if ckpt is None: raise FileNotFoundError(f"Checkpoint not found at {ckpt_path}")
     theta, obs_dim, act_dim = np.array(ckpt["theta"]), ckpt["obs_dim"], ckpt["act_dim"]
     w_size = obs_dim * act_dim
     W, B = theta[:w_size].reshape(obs_dim, act_dim), theta[w_size:]
-    m, d = mujoco.MjModel.from_xml_path(xml_path), mujoco.MjData(m)
-    ctrl_center = (m.actuator_ctrlrange[:, 0] + m.actuator_ctrlrange[:, 1]) / 2.0
-    ctrl_half = (m.actuator_ctrlrange[:, 1] - m.actuator_ctrlrange[:, 0]) / 2.0
-    def obs_from_md(data): return np.concatenate([data.qpos[7:], data.qvel])
-    def scale_action_np(a_unit): return ctrl_center + ctrl_half * np.tanh(a_unit)
-    def reset_env():
-        mujoco.mj_resetData(m, d)
-        noise = 0.01 * np.random.randn(d.qpos.shape[0])
-        noise[:7] = 0.0
-        d.qpos[:] += noise
-        mujoco.mj_forward(m, d)
-    reset_env()
-    with mujoco.viewer.launch_passive(m, d) as v:
-        def key_callback(keycode):
-            if keycode == ord('R') or keycode == ord('r'): reset_env()
-        v.user_key_callback = key_callback
-        while v.is_running():
-            step_start = time.time()
-            obs = obs_from_md(d)
-            a_unit = np.tanh(obs @ W + B)
-            d.ctrl[:] = scale_action_np(a_unit)
-            for _ in range(action_repeat): mujoco.mj_step(m, d)
-            v.sync()
-            time_until_next_step = m.opt.timestep * action_repeat - (time.time() - step_start)
-            if time_until_next_step > 0: time.sleep(time_until_next_step)
-
-def run_debug_viewer(xml_path: str, **kwargs):
-    print("--- 디버깅 뷰어 모드 ---")
     m = mujoco.MjModel.from_xml_path(xml_path)
     d = mujoco.MjData(m)
-    obs_dim, act_dim = m.nq - 7 + m.nv, m.nu
-    W, B = 0.01 * np.random.randn(obs_dim, act_dim), np.zeros(act_dim)
     ctrl_center = (m.actuator_ctrlrange[:, 0] + m.actuator_ctrlrange[:, 1]) / 2.0
     ctrl_half = (m.actuator_ctrlrange[:, 1] - m.actuator_ctrlrange[:, 0]) / 2.0
-    action_repeat, z_threshold = kwargs['action_repeat'], kwargs['z_threshold']
-    ctrl_cost_weight, alive_bonus = kwargs['ctrl_cost_weight'], kwargs['alive_bonus']
-    contact_penalty_weight, tilt_penalty_weight = kwargs['contact_penalty_weight'], kwargs['tilt_penalty_weight']
-    ground_id = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, 'floor')
-    if ground_id == -1: ground_id = 0
-    NON_FOOT_GEOM_NAMES = [
-        'torso', 'front_left_leg', 'front_right_leg', 'back_left_leg', 'back_right_leg',
-        'front_left_shin', 'front_right_shin', 'back_left_shin', 'back_right_shin'
-    ]
-    non_foot_geom_ids = np.array([mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, name) for name in NON_FOOT_GEOM_NAMES])
     def obs_from_md(data): return np.concatenate([data.qpos[7:], data.qvel])
     def scale_action_np(a_unit): return ctrl_center + ctrl_half * np.tanh(a_unit)
     def reset_env():
@@ -338,11 +324,10 @@ def run_debug_viewer(xml_path: str, **kwargs):
         noise[:7] = 0.0
         d.qpos[:] += noise
         mujoco.mj_forward(m, d)
-        print("\n--- 환경 리셋 ---")
     reset_env()
-    with mujoco.viewer.launch_passive(m, d) as v:
+    with mj_viewer.launch_passive(m, d) as v:
         def key_callback(keycode):
-            if keycode == ord('R') or keycode == ord('r'): reset_env()
+            if keycode in (ord('R'), ord('r')): reset_env()
         v.user_key_callback = key_callback
         while v.is_running():
             step_start = time.time()
@@ -350,31 +335,6 @@ def run_debug_viewer(xml_path: str, **kwargs):
             a_unit = np.tanh(obs @ W + B)
             d.ctrl[:] = scale_action_np(a_unit)
             for _ in range(action_repeat): mujoco.mj_step(m, d)
-            
-            # ▼▼▼ [버그 수정] 디버그 뷰어의 인덱스도 모두 수정 ▼▼▼
-            vx = d.qvel[0]
-            ctrl_cost = ctrl_cost_weight * np.sum(np.square(d.ctrl))
-            base_reward = alive_bonus + vx - ctrl_cost
-            num_bad_contacts = 0
-            for i in range(d.ncon):
-                contact = d.contact[i]
-                geom1, geom2 = contact.geom1, contact.geom2
-                is_geom1_bad = np.any(geom1 == non_foot_geom_ids)
-                is_geom2_bad = np.any(geom2 == non_foot_geom_ids)
-                is_geom1_ground = (geom1 == ground_id)
-                is_geom2_ground = (geom2 == ground_id)
-                if (is_geom1_ground or is_geom2_ground) and (is_geom1_bad or is_geom2_bad):
-                    num_bad_contacts += 1
-            contact_penalty = contact_penalty_weight * num_bad_contacts
-            torso_angular_velocity = d.qvel[3:5]
-            tilt_penalty = tilt_penalty_weight * np.sum(np.square(torso_angular_velocity))
-            reward = base_reward - contact_penalty - tilt_penalty
-            z = d.qpos[2]
-            # ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
-            
-            isnan = np.any(np.isnan(d.qpos)) or np.any(np.isnan(d.qvel))
-            done = bool(isnan or (z < z_threshold))
-            print(f"reward={reward:.4f}, vx={vx:.3f}, z={z:.3f}, done={done}, bad_contacts={num_bad_contacts}")
             v.sync()
             time_until_next_step = m.opt.timestep * action_repeat - (time.time() - step_start)
             if time_until_next_step > 0: time.sleep(time_until_next_step)
@@ -383,48 +343,48 @@ def run_debug_viewer(xml_path: str, **kwargs):
 # 4. 스크립트 실행 메인 블록
 # ==============================================================================
 def parse_args():
-    """커맨드라인 인자를 파싱하는 함수"""
     p = argparse.ArgumentParser(description="MJX + ARS trainer/viewer for quadruped")
-    p.add_argument("--xml", type=str, required=True, dest="xml_path", help="학습할 MJCF 모델의 XML 파일 경로")
-    p.add_argument("--infer", action="store_true", help="추론 모드로 실행")
-    p.add_argument("--view", action="store_true", help="뷰어 모드로 실행")
-    p.add_argument("--resume", action="store_true", help="기존 체크포인트에서 이어서 학습")
-    p.add_argument("--debug-viewer", action="store_true", help="무작위 정책으로 실시간 디버깅 뷰어 실행")
+    p.add_argument("--xml", type=str, required=True, dest="xml_path")
+    p.add_argument("--infer", action="store_true")
+    p.add_argument("--view", action="store_true")
+    p.add_argument("--resume", action="store_true")
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--num-envs", type=int, default=1024)
-    p.add_argument("--num-dirs", type=int, default=32)
-    p.add_argument("--top-dirs", type=int, default=8)
-    p.add_argument("--episode-length", type=int, default=400)
+    # H100 추천 기본값
+    p.add_argument("--num-envs", type=int, default=2048, help="병렬로 실행할 환경 수")
+    p.add_argument("--num-dirs", type=int, default=96, help="ARS 탐색 방향 수")
+    p.add_argument("--top-dirs", type=int, default=24, help="업데이트에 사용할 상위 방향 수")
+    p.add_argument("--episode-length", type=int, default=300)
     p.add_argument("--action-repeat", type=int, default=2)
-    p.add_argument("--iterations", type=int, default=200)
-    p.add_argument("--dir-batch", type=int, default=8, help="방향 평가를 위한 소배치 크기")
+    p.add_argument("--iterations", type=int, default=1000)
+    p.add_argument("--dir-chunk", type=int, default=32, help="num_dirs를 나눠 평가할 chunk 크기")
     p.add_argument("--step-size", type=float, default=0.02)
-    p.add_argument("--noise-std", type=float, default=0.05)
+    p.add_argument("--noise-std", type=float, default=0.03)
     p.add_argument("--z-threshold", type=float, default=0.25)
-    p.add_argument("--alive-bonus", type=float, default=0.05)
-    p.add_argument("--eval-every", type=int, default=50)
-    p.add_argument("--ckpt-every", type=int, default=25, help="체크포인트 저장 주기")
-    p.add_argument("--save-path", type=str, default="ars_policy.npz")
-    p.add_argument("--gl-backend", type=str, choices=["egl", "glfw", "osmesa"], default=None)
     p.add_argument("--ctrl-cost-weight", type=float, default=1e-4)
+    p.add_argument("--alive-bonus", type=float, default=0.05)
     p.add_argument("--contact-penalty-weight", type=float, default=2e-3)
     p.add_argument("--tilt-penalty-weight", type=float, default=1e-3)
+    p.add_argument("--forward-axis", choices=["x", "y", "z"], default="x")
+    p.add_gument("--forward-sign", type=int, choices=[-1, 1], default=1)
+    p.add_argument("--target-speed", type=float, default=0.5)
+    p.add_argument("--overspeed-weight", type=float, default=1.0)
+    p.add_argument("--eval-every", type=int, default=10)
+    p.add_argument("--ckpt-every", type=int, default=10)
+    p.add_argument("--save-path", type=str, default="ars_policy.npz")
+    p.add_argument("--gl-backend", type=str, choices=["egl", "glfw", "osmesa"], default=None)
     return p.parse_args()
 
 if __name__ == "__main__":
     args = parse_args()
-    if args.view or args.debug_viewer:
+    if args.view:
         os.environ["MUJOCO_GL"] = "glfw"
     else:
         os.environ["MUJOCO_GL"] = args.gl_backend or os.environ.get("MUJOCO_GL", "egl")
     os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
-    if args.debug_viewer:
-        run_debug_viewer(**vars(args))
-    elif args.view:
+    if args.view:
         run_viewer(xml_path=args.xml_path, ckpt_path=args.save_path, action_repeat=args.action_repeat)
     elif args.infer:
-        run_inference(xml_path=args.xml_path, ckpt_path=args.save_path, num_envs=args.num_envs,
-                      episode_length=args.episode_length, action_repeat=args.action_repeat, seed=args.seed)
+        run_inference(xml_path=args.xml_path, ckpt_path=args.save_path, **vars(args))
     else:
         ars_train(**vars(args))
