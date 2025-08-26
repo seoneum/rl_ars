@@ -86,7 +86,9 @@ def make_mjx_env(xml_path: str, **kwargs):
             if m.jnt_type[jid] in (mujoco.mjtJoint.mjJNT_HINGE, mujoco.mjtJoint.mjJNT_SLIDE):
                 knee_jids.append(jid)
 
-    knee_jids = np.array(knee_jids, dtype=np.int32)
+    # 로컬 파이썬 numpy를 사용하여 JAX로 전달할 배열 생성
+    import numpy as _np
+    knee_jids = _np.array(knee_jids, dtype=_np.int32)
     knee_qadr = jnp.array(m.jnt_qposadr[knee_jids], dtype=jnp.int32) if knee_jids.size > 0 else jnp.zeros((0,), dtype=jnp.int32)
     knee_min = jnp.array(m.jnt_range[knee_jids, 0], dtype=jnp.float32) if knee_jids.size > 0 else jnp.zeros((0,), dtype=jnp.float32)
     knee_max = jnp.array(m.jnt_range[knee_jids, 1], dtype=jnp.float32) if knee_jids.size > 0 else jnp.zeros((0,), dtype=jnp.float32)
@@ -113,12 +115,14 @@ def make_mjx_env(xml_path: str, **kwargs):
     base_w = jnp.float32(kwargs.get('base_vel_penalty_weight', 0.02))
     st_w = jnp.float32(kwargs.get('streak_weight', 0.01))
     st_scale = jnp.float32(kwargs.get('streak_scale', 60.0))
-    # [신규] 무릎 관련 파라미터
+
+    # [신규] 무릎 및 초기 자세 관련 파라미터 스칼라 캐스팅
     crouch_r = jnp.float32(kwargs.get('crouch_init_ratio', 0.20))
     crouch_n = jnp.float32(kwargs.get('crouch_init_noise', 0.03))
-    knee_lo = jnp.float32(kwargs.get('knee_band_low', 0.50))
-    knee_hi = jnp.float32(kwargs.get('knee_band_high', 0.70))
-    knee_w = jnp.float32(kwargs.get('knee_band_weight', 0.8))
+    pitch0   = jnp.float32(kwargs.get('init_pitch', -0.12))
+    knee_lo  = jnp.float32(kwargs.get('knee_band_low', 0.50))
+    knee_hi  = jnp.float32(kwargs.get('knee_band_high', 0.70))
+    knee_w   = jnp.float32(kwargs.get('knee_band_weight', 0.8))
     knee_pen = jnp.float32(kwargs.get('knee_over_penalty', 0.05))
 
     def scale_action(a_unit: jnp.ndarray) -> jnp.ndarray:
@@ -144,9 +148,17 @@ def make_mjx_env(xml_path: str, **kwargs):
             knee_target = knee_min + crouch_r * knee_span + knee_noise * knee_span
             qpos = qpos.at[knee_qadr].set(knee_target)
 
+        # [신규] 몸통 pitch(자유관절 quaternion: [w,x,y,z]) – y축 회전
+        # pitch0(rad): 앞쪽으로 숙임이면 음수
+        half = 0.5 * pitch0
+        q_w = jnp.cos(half)
+        q_y = jnp.sin(half)
+        qpos = qpos.at[3:7].set(jnp.array([q_w, 0.0, q_y, 0.0], dtype=jnp.float32))
+
         dd = replace(dd, qpos=qpos, qvel=zero_qvel, ctrl=zero_ctrl)
         obs = obs_from_dd(dd)
         streak0 = jnp.array(0.0, dtype=jnp.float32)
+        # 상태 튜플 구조에 맞게 반환
         return (dd, obs, jnp.array(False, dtype=jnp.bool_), zero_ctrl, streak0), obs
 
     def upright_from_quat(q: jnp.ndarray) -> jnp.ndarray:
@@ -196,8 +208,8 @@ def make_mjx_env(xml_path: str, **kwargs):
         # [신규] 무릎 밴드 보상 및 패널티 계산
         if knee_qadr.shape[0] > 0:
             knee_q = dd.qpos[knee_qadr]
-            knee_ratio = jnp.clip((knee_q - knee_min) / knee_span, 0.0, 1.0)
-            knee_band_score = band_parabola(knee_ratio, knee_lo, knee_hi)
+            knee_ratio = jnp.clip((knee_q - knee_min) / knee_span, 0.0, 1.0) # 0~1
+            knee_band_score = band_parabola(knee_ratio, knee_lo, knee_hi) # 각 무릎 0~1
             knee_band_mean = jnp.mean(knee_band_score)
             under = jnp.clip(knee_lo - knee_ratio, 0.0, 1.0)
             over  = jnp.clip(knee_ratio - knee_hi, 0.0, 1.0)
@@ -210,7 +222,7 @@ def make_mjx_env(xml_path: str, **kwargs):
         tilt_pen = tilt_w * (1.0 - up)
         ang_pen = ang_w * jnp.sum(jnp.square(dd.qvel[3:5].astype(jnp.float32)))
         act_pen = actdw * jnp.sum(jnp.square(ctrl - prev_ctrl))
-        
+
         mask_xy = jnp.array([1.0, 1.0], dtype=jnp.float32)
         mask_xy = lax.cond((fwd_idx < 2), lambda m: m.at[fwd_idx].set(0.0), lambda m: m, mask_xy)
         lin_xy = dd.qvel[0:2].astype(jnp.float32) * mask_xy
@@ -262,8 +274,8 @@ def ars_train(xml_path: str, **kwargs):
         'target_z_low','target_z_high','upright_min',
         'angvel_penalty_weight','act_delta_weight','base_vel_penalty_weight',
         'streak_weight','streak_scale',
-        # [신규] 무릎 관련 인자 추가
-        'knee_patterns','crouch_init_ratio','crouch_init_noise',
+        # [신규] 무릎 및 초기 자세 관련 인자 추가
+        'knee_patterns','crouch_init_ratio','crouch_init_noise','init_pitch',
         'knee_band_low','knee_band_high','knee_band_weight','knee_over_penalty',
     ]
     reset_batch, step_batch, info = make_mjx_env(xml_path=xml_path, **{k: kwargs[k] for k in env_params_keys})
@@ -311,7 +323,7 @@ def ars_train(xml_path: str, **kwargs):
             st2, (ob_next, r, done) = step_batch(st, act)
             is_alive = (1.0 - done)
             return (st2, ob_next, ret + r*is_alive, sum_up + up*is_alive, sum_z + z*is_alive, alive_steps + is_alive), None
-        
+
         init = (state, obs, *[jnp.zeros(num_envs, jnp.float32) for _ in range(4)])
         (_, _, returns, sum_up, sum_z, alive_steps), _ = lax.scan(body, init, None, length=episode_length)
         total_alive_steps = jnp.maximum(jnp.sum(alive_steps), 1.0)
@@ -399,8 +411,8 @@ def run_inference(xml_path: str, ckpt_path: str, **kwargs):
         'target_z_low','target_z_high','upright_min',
         'angvel_penalty_weight','act_delta_weight','base_vel_penalty_weight',
         'streak_weight','streak_scale',
-        # [신규] 무릎 관련 인자 추가
-        'knee_patterns','crouch_init_ratio','crouch_init_noise',
+        # [신규] 무릎 및 초기 자세 관련 인자 추가
+        'knee_patterns','crouch_init_ratio','crouch_init_noise','init_pitch',
         'knee_band_low','knee_band_high','knee_band_weight','knee_over_penalty',
     ]
     reset_batch, step_batch, _ = make_mjx_env(xml_path=xml_path, **{k: kwargs[k] for k in env_params_keys})
@@ -423,7 +435,7 @@ def run_inference(xml_path: str, ckpt_path: str, **kwargs):
             st2, (ob_next, r, done) = step_batch(st, act)
             is_alive = (1.0 - done)
             return (st2, ob_next, ret + r*is_alive, sum_up + up*is_alive, sum_z + z*is_alive, alive_steps + is_alive), None
-        
+
         init = (state, obs, *[jnp.zeros(num_envs, jnp.float32) for _ in range(4)])
         (_, _, returns, sum_up, sum_z, alive_steps), _ = lax.scan(body, init, None, length=episode_length)
         total_alive_steps = jnp.maximum(jnp.sum(alive_steps), 1.0)
@@ -448,7 +460,7 @@ def parse_args():
     p.add_argument("--top-dirs", type=int, default=4)
     p.add_argument("--episode-length", type=int, default=250)
     p.add_argument("--action-repeat", type=int, default=2)
-    p.add_argument("--iterations", type=int, default=500)
+    p.add_argument("--iterations", type=int, default=1000)
     p.add_argument("--dir-chunk", type=int, default=8)
     p.add_argument("--step-size", type=float, default=0.010)
     p.add_argument("--noise-std", type=float, default=0.015)
@@ -467,17 +479,20 @@ def parse_args():
     p.add_argument("--streak-weight", type=float, default=0.01)
     p.add_argument("--streak-scale", type=float, default=60.0)
     p.add_argument("--forward-axis", choices=["x", "y", "z"], default="x")
-    p.add_argument("--forward-sign", type=int, choices=[-1, 1], default=1)
+    p.add_argument("--forward-sign", type=int, choices=[-1, 1], default=-1)
     p.add_argument("--target-speed", type=float, default=0.35)
     p.add_argument("--overspeed-weight", type=float, default=1.2)
+
     # --- [신규] 초기 앉기 및 무릎 밴드 제어 인자 ---
-    p.add_argument("--knee-patterns", type=str, default="knee", help="무릎 관절 이름 부분문자열 (쉼표로 구분)")
-    p.add_argument("--crouch-init-ratio", type=float, default=0.20, help="무릎 신장 비율 초기값 (0=최소각, 1=최대각)")
-    p.add_argument("--crouch-init-noise", type=float, default=0.03, help="초기 무릎 각도에 추가할 잡음 (관절 span 비율)")
-    p.add_argument("--knee-band-low", type=float, default=0.50, help="무릎 신장 비율 하한 (50%)")
-    p.add_argument("--knee-band-high", type=float, default=0.70, help="무릎 신장 비율 상한 (70%)")
+    p.add_argument("--knee-patterns", type=str, default="knee", help="무릎 관절 이름 부분문자열(쉼표 구분). 예: knee,kneer")
+    p.add_argument("--crouch-init-ratio", type=float, default=0.20, help="무릎 신장 비율 초기값(0=최소각,1=최대각). 깊게 앉기면 0.15~0.25")
+    p.add_argument("--crouch-init-noise", type=float, default=0.03, help="초기 무릎 각도에 더할 잡음(관절 span 비율)")
+    p.add_argument("--init-pitch", type=float, default=-0.12, help="초기 몸통 pitch(rad, y축 회전). 앞쪽으로 약간 숙임")
+    p.add_argument("--knee-band-low", type=float, default=0.50, help="무릎 신장 비율 하한(50%)")
+    p.add_argument("--knee-band-high", type=float, default=0.70, help="무릎 신장 비율 상한(70%)")
     p.add_argument("--knee-band-weight", type=float, default=0.8, help="무릎 밴드 보상 가중치")
-    p.add_argument("--knee-over-penalty", type=float, default=0.05, help="무릎 밴드 밖 (과신전/과굴곡) 패널티 가중치")
+    p.add_argument("--knee-over-penalty", type=float, default=0.05, help="무릎 밴드 밖(과신전/과굴곡) 패널티 가중치")
+
     # --- 로깅 및 저장 ---
     p.add_argument("--eval-every", type=int, default=10)
     p.add_argument("--ckpt-every", type=int, default=10)
