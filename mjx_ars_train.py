@@ -1,4 +1,3 @@
-
 # ==============================================================================
 # 0. JAX 환경 설정 (가장 먼저 실행)
 # ==============================================================================
@@ -187,6 +186,11 @@ def make_policy_fns(obs_dim: int, act_dim: int) -> Tuple[Callable, Callable]:
 
 def ars_train(xml_path: str, **kwargs):
     seed, num_envs, episode_length = kwargs['seed'], kwargs['num_envs'], kwargs['episode_length']
+    
+    # 학습 시작 시 설정 로그 출력
+    steps_per_iter = (2 * kwargs["num_dirs"] * kwargs["num_envs"] * kwargs["episode_length"] * kwargs["action_repeat"])
+    print(f"[Config] steps/iter ≈ {steps_per_iter:,}  | dir_chunk={kwargs.get('dir_chunk')}")
+
     reset_batch, step_batch, info = make_mjx_env(
         xml_path=xml_path, 
         **{k: kwargs[k] for k in ['action_repeat', 'z_threshold', 'ctrl_cost_weight', 'alive_bonus',
@@ -243,10 +247,7 @@ def ars_train(xml_path: str, **kwargs):
         base_keys = random.split(k_dirs, kwargs["num_dirs"] * num_envs).reshape(kwargs["num_dirs"], num_envs, 2)
         
         dir_chunk = kwargs.get("dir_chunk")
-        if dir_chunk is None:
-            # jit 함수를 직접 호출하기 위해 eval_chunk 사용
-            R_plus, R_minus = eval_chunk(theta, deltas, base_keys)
-        else:
+        if dir_chunk:
             R_plus_list, R_minus_list = [], []
             for s in range(0, kwargs["num_dirs"], dir_chunk):
                 e = min(s + dir_chunk, kwargs["num_dirs"])
@@ -254,6 +255,8 @@ def ars_train(xml_path: str, **kwargs):
                 R_plus_list.append(r_p); R_minus_list.append(r_m)
             R_plus = jnp.concatenate(R_plus_list, axis=0)
             R_minus = jnp.concatenate(R_minus_list, axis=0)
+        else:
+            R_plus, R_minus = eval_chunk(theta, deltas, base_keys)
         
         scores = jnp.maximum(R_plus, R_minus)
         topk_idx = jnp.argsort(scores)[-kwargs["top_dirs"]:]
@@ -350,9 +353,9 @@ def parse_args():
     p.add_argument("--resume", action="store_true")
     p.add_argument("--seed", type=int, default=0)
     # H100 추천 기본값
-    p.add_argument("--num-envs", type=int, default=2048, help="병렬로 실행할 환경 수")
-    p.add_argument("--num-dirs", type=int, default=96, help="ARS 탐색 방향 수")
-    p.add_argument("--top-dirs", type=int, default=24, help="업데이트에 사용할 상위 방향 수")
+    p.add_argument("--num-envs", type=int, default=512)
+    p.add_argument("--num-dirs", type=int, default=64)
+    p.add_argument("--top-dirs", type=int, default=16)
     p.add_argument("--episode-length", type=int, default=300)
     p.add_argument("--action-repeat", type=int, default=2)
     p.add_argument("--iterations", type=int, default=1000)
@@ -365,7 +368,7 @@ def parse_args():
     p.add_argument("--contact-penalty-weight", type=float, default=2e-3)
     p.add_argument("--tilt-penalty-weight", type=float, default=1e-3)
     p.add_argument("--forward-axis", choices=["x", "y", "z"], default="x")
-    p.add_gument("--forward-sign", type=int, choices=[-1, 1], default=1)
+    p.add_argument("--forward-sign", type=int, choices=[-1, 1], default=1)
     p.add_argument("--target-speed", type=float, default=0.5)
     p.add_argument("--overspeed-weight", type=float, default=1.0)
     p.add_argument("--eval-every", type=int, default=10)
@@ -380,7 +383,10 @@ if __name__ == "__main__":
         os.environ["MUJOCO_GL"] = "glfw"
     else:
         os.environ["MUJOCO_GL"] = args.gl_backend or os.environ.get("MUJOCO_GL", "egl")
-    os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+    
+    # H100 환경에서는 셸에서 XLA_PYTHON_CLIENT_PREALLOCATE=true로 설정하는 것을 권장하므로,
+    # 이 라인은 주석 처리하거나 삭제할 수 있습니다.
+    # os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
     if args.view:
         run_viewer(xml_path=args.xml_path, ckpt_path=args.save_path, action_repeat=args.action_repeat)
