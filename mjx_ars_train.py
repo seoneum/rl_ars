@@ -70,20 +70,18 @@ def make_mjx_env(xml_path: str, **kwargs):
 
     nu, nv, nq = int(m.nu), int(m.nv), int(m.nq)
 
-    # 액션 스케일링을 위한 파라미터
     ctrl_low = jnp.array(m.actuator_ctrlrange[:, 0], dtype=np.float32)
     ctrl_high = jnp.array(m.actuator_ctrlrange[:, 1], dtype=np.float32)
     ctrl_center = (ctrl_low + ctrl_high) / 2.0
     ctrl_half = (ctrl_high - ctrl_low) / 2.0
 
-    # JIT 컴파일을 위해 kwargs에서 파라미터를 추출하여 명시적 JAX 타입으로 변환
-    action_repeat = int(kwargs.get('action_repeat', 3))
+    action_repeat = int(kwargs.get('action_repeat', 2))
     z_th = jnp.float32(kwargs.get('z_threshold', 0.32))
     ctrl_w = jnp.float32(kwargs.get('ctrl_cost_weight', 2e-4))
     tilt_w = jnp.float32(kwargs.get('tilt_penalty_weight', 3e-2))
     fwd_idx = {"x": 0, "y": 1, "z": 2}[kwargs.get('forward_axis', 'x')]
     fsign = jnp.float32(kwargs.get('forward_sign', 1))
-    tgt_speed = jnp.float32(kwargs.get('target_speed', 0.35))
+    tgt_speed = jnp.float32(kwargs.get('target_speed', 0.15))
     over_w = jnp.float32(kwargs.get('overspeed_weight', 1.2))
     sp_w = jnp.float32(kwargs.get('speed_weight', 0.0))
     stand_b = jnp.float32(kwargs.get('stand_bonus', 0.20))
@@ -113,11 +111,9 @@ def make_mjx_env(xml_path: str, **kwargs):
         qpos = qpos0 + noise.at[:7].set(0.0)
         dd = replace(dd, qpos=qpos, qvel=zero_qvel, ctrl=zero_ctrl)
         obs = obs_from_dd(dd)
-        # 상태에 'streak' 카운터 추가
         streak0 = jnp.array(0.0, dtype=jnp.float32)
         return (dd, obs, jnp.array(False, dtype=jnp.bool_), zero_ctrl, streak0), obs
 
-    # --- 보상 계산을 위한 헬퍼 함수 ---
     def upright_from_quat(q: jnp.ndarray) -> jnp.ndarray:
         return 1.0 - 2.0 * (q[1]**2 + q[2]**2)
 
@@ -145,44 +141,48 @@ def make_mjx_env(xml_path: str, **kwargs):
         dd = lax.cond(done_prev, lambda d: d, integrate_if_alive, dd)
         obs = obs_from_dd(dd)
 
-        # --- 보상 계산 시작 ---
         base_z = dd.qpos[2].astype(jnp.float32)
         up = jnp.clip(upright_from_quat(dd.qpos[3:7]), 0.0, 1.0)
         forward_speed = (dd.qvel[fwd_idx] * fsign).astype(jnp.float32)
 
-        # 보상 1: 목표 자세 유지 (Shaping)
         z_band = band_parabola(base_z, z_lo, z_hi)
         up_band = band_parabola(up, up_min, 0.98)
         stand_shape = 0.5 * (z_band + up_band)
         stand_gate_soft = between_gate(base_z, z_lo, z_hi) * sgate(up, up_min)
 
-        # 보상 2: 속도 (speed_weight로 켜고 끌 수 있음)
         reward_forward = jnp.minimum(forward_speed, tgt_speed)
         overspeed = jnp.maximum(forward_speed - tgt_speed, 0.0)
         speed_term = sp_w * stand_gate_soft * (reward_forward - over_w * (overspeed**2))
 
-        # 보상 3: 오래 서 있기 (Streak Bonus)
         is_standing_now = (stand_gate_soft > 0.6) & (~done_prev)
         streak_next = jnp.where(is_standing_now, streak + 1.0, 0.0)
         streak_reward = st_w * jnp.tanh(streak_next / st_scale)
 
-        # 패널티: 흔들림 억제
         ctrl_cost = ctrl_w * jnp.sum(jnp.square(ctrl))
         tilt_pen = tilt_w * (1.0 - up)
         ang_pen = ang_w * jnp.sum(jnp.square(dd.qvel[3:5].astype(jnp.float32)))
-        base_lin_pen = jnp.sum(jnp.square(dd.qvel[0:2].astype(jnp.float32)))
-        base_ang_pen = jnp.sum(jnp.square(dd.qvel[5].astype(jnp.float32))) # yaw 각속도만
-        base_pen = base_w * (base_lin_pen + base_ang_pen)
         act_pen = actdw * jnp.sum(jnp.square(ctrl - prev_ctrl))
 
-        # 최종 보상 조합
+        # --- [코드 패치 적용] ---
+        # 전진축(x 또는 y)을 제외하고 횡방향 속도에만 패널티를 부과합니다.
+        mask_xy = jnp.array([1.0, 1.0], dtype=jnp.float32)
+        mask_xy = lax.cond(
+            (fwd_idx < 2),
+            lambda m: m.at[fwd_idx].set(0.0), # 전진축이 x(0) 또는 y(1)이면 해당 마스크를 0으로
+            lambda m: m,                      # 전진축이 z이면 그대로 둠
+            mask_xy
+        )
+        lin_xy = dd.qvel[0:2].astype(jnp.float32) * mask_xy
+        base_ang = dd.qvel[3:5].astype(jnp.float32) # roll/pitch 각속도
+        base_pen = base_w * (jnp.sum(jnp.square(lin_xy)) + jnp.sum(jnp.square(base_ang)))
+        # --- [코드 패치 끝] ---
+
         reward = (stand_b
                   + stand_w * stand_shape
                   + streak_reward
                   + speed_term
                   - (tilt_pen + ang_pen + base_pen + act_pen + ctrl_cost))
 
-        # 종료 조건
         isnan = jnp.any(jnp.isnan(dd.qpos)) | jnp.any(jnp.isnan(dd.qvel))
         done_now = jnp.logical_or(isnan, jnp.logical_or(base_z < z_th, up < 0.2))
         done = jnp.logical_or(done_prev, done_now)
@@ -343,7 +343,6 @@ def run_inference(xml_path: str, ckpt_path: str, **kwargs):
     theta, obs_dim, act_dim = ckpt["theta"], ckpt["obs_dim"], ckpt["act_dim"]
     _, policy_apply = make_policy_fns(obs_dim, act_dim)
 
-    # kwargs에 체크포인트의 메타 정보가 있다면 우선 사용
     if ckpt.get("meta"):
         for k, v in ckpt["meta"].items():
             kwargs.setdefault(k, v)
@@ -392,42 +391,37 @@ def run_inference(xml_path: str, ckpt_path: str, **kwargs):
 # ==============================================================================
 def parse_args():
     p = argparse.ArgumentParser(description="Headless-only MJX + ARS trainer for quadruped (crouch-stand first)")
-    # --- 기본 설정 ---
     p.add_argument("--xml", type=str, required=True, dest="xml_path")
     p.add_argument("--infer", action="store_true")
     p.add_argument("--resume", action="store_true")
     p.add_argument("--seed", type=int, default=0)
-    # --- 학습 파라미터 ---
     p.add_argument("--num-envs", type=int, default=128)
     p.add_argument("--num-dirs", type=int, default=16)
-    p.add_argument("--top-dirs", type=int, default=8)
-    p.add_argument("--episode-length", type=int, default=300)
-    p.add_argument("--action-repeat", type=int, default=3)
-    p.add_argument("--iterations", type=int, default=1000)
+    p.add_argument("--top-dirs", type=int, default=4)
+    p.add_argument("--episode-length", type=int, default=250)
+    p.add_argument("--action-repeat", type=int, default=2)
+    p.add_argument("--iterations", type=int, default=500)
     p.add_argument("--dir-chunk", type=int, default=8)
     p.add_argument("--step-size", type=float, default=0.010)
     p.add_argument("--noise-std", type=float, default=0.015)
-    # --- 환경 및 보상 파라미터 (안정적 서기 중점) ---
-    p.add_argument("--z-threshold", type=float, default=0.32, help="에피소드 종료 높이")
+    p.add_argument("--z-threshold", type=float, default=0.32)
     p.add_argument("--ctrl-cost-weight", type=float, default=2e-4)
     p.add_argument("--tilt-penalty-weight", type=float, default=3e-2)
     p.add_argument("--stand-bonus", type=float, default=0.20)
     p.add_argument("--stand-shape-weight", type=float, default=1.20)
-    p.add_argument("--speed-weight", type=float, default=0.0, help="속도 보상 가중치 (0으로 두면 서기만 학습)")
-    p.add_argument("--target-z-low", type=float, default=0.50, help="목표 높이 구간 (최소)")
-    p.add_argument("--target-z-high", type=float, default=0.60, help="목표 높이 구간 (최대)")
-    p.add_argument("--upright-min", type=float, default=0.75, help="최소 upright 자세")
+    p.add_argument("--speed-weight", type=float, default=0.0)
+    p.add_argument("--target-z-low", type=float, default=0.50)
+    p.add_argument("--target-z-high", type=float, default=0.60)
+    p.add_argument("--upright-min", type=float, default=0.75)
     p.add_argument("--angvel-penalty-weight", type=float, default=0.01)
     p.add_argument("--act-delta-weight", type=float, default=1e-4)
     p.add_argument("--base-vel-penalty-weight", type=float, default=0.02)
     p.add_argument("--streak-weight", type=float, default=0.01)
     p.add_argument("--streak-scale", type=float, default=60.0)
-    # --- (참고용) 속도 관련 파라미터 ---
     p.add_argument("--forward-axis", choices=["x", "y", "z"], default="x")
-    p.add_argument("--forward-sign", type=int, choices=[-1, 1], default=1)
-    p.add_argument("--target-speed", type=float, default=0.35)
+    p.add_argument("--forward-sign", type=int, choices=[-1, 1], default=-1)
+    p.add_argument("--target-speed", type=float, default=0.15)
     p.add_argument("--overspeed-weight", type=float, default=1.2)
-    # --- 로깅 및 저장 ---
     p.add_argument("--eval-every", type=int, default=10)
     p.add_argument("--ckpt-every", type=int, default=10)
     p.add_argument("--save-path", type=str, default="ars_policy.npz")
@@ -443,4 +437,3 @@ if __name__ == "__main__":
         run_inference(xml_path=xml, ckpt_path=ckpt, **kwargs)
     else:
         ars_train(**vars(args))
-
