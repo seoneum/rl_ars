@@ -71,37 +71,28 @@ def make_mjx_env(xml_path: str,
                  action_repeat: int = 4,
                  z_threshold: float = 0.25,
                  ctrl_cost_weight: float = 1e-3,
-                 alive_bonus: float = 0.05,
-                 contact_penalty_weight: float = 2e-3,
                  tilt_penalty_weight: float = 1e-3,
                  forward_axis: str = "x",
                  forward_sign: int = 1,
-                 target_speed: float = 0.8,
-                 overspeed_weight: float = 0.5
+                 target_speed: float = 0.3,
+                 overspeed_weight: float = 0.5,
+                 stand_bonus: float = 0.1,
+                 stand_shape_weight: float = 0.3
                  ):
     m = mujoco.MjModel.from_xml_path(xml_path)
     mm = mjx.put_model(m)
 
-    ground_id = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, 'floor')
-    if ground_id == -1: ground_id = 0
-
-    NON_FOOT_GEOM_NAMES = [
-        'torso', 'front_left_leg', 'front_right_leg', 'back_left_leg', 'back_right_leg',
-        'front_left_shin', 'front_right_shin', 'back_left_shin', 'back_right_shin'
-    ]
-    
-    non_foot_geom_ids = [mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, name) for name in NON_FOOT_GEOM_NAMES]
-    non_foot_geom_ids_jnp = jnp.array([i for i in non_foot_geom_ids if i != -1])
-    
     ctrl_low = jnp.array(m.actuator_ctrlrange[:, 0], dtype=jnp.float32)
     ctrl_high = jnp.array(m.actuator_ctrlrange[:, 1], dtype=jnp.float32)
     ctrl_center = (ctrl_low + ctrl_high) / 2.0
     ctrl_half = (ctrl_high - ctrl_low) / 2.0
 
     def scale_action(a_unit: jnp.ndarray) -> jnp.ndarray:
+        """액션 값을 [-1, 1]에서 실제 컨트롤 범위로 스케일링합니다."""
         return ctrl_center + ctrl_half * jnp.tanh(a_unit)
 
     def obs_from_dd(dd: Any) -> jnp.ndarray:
+        """MJX 데이터에서 관측 벡터를 추출합니다."""
         return jnp.concatenate([dd.qpos[7:], dd.qvel], axis=0).astype(jnp.float32)
 
     qpos0 = jnp.array(m.qpos0, dtype=jnp.float32)
@@ -115,6 +106,7 @@ def make_mjx_env(xml_path: str,
     over_w = jnp.float32(overspeed_weight)
 
     def reset_single(key: jax.Array) -> Tuple[Tuple[Any, ...], jnp.ndarray]:
+        """단일 환경을 리셋합니다."""
         dd = mjx.make_data(mm)
         noise = 0.01 * random.normal(key, (qpos0.shape[0],), dtype=jnp.float32)
         qpos = qpos0 + noise.at[:7].set(0.0)
@@ -122,7 +114,13 @@ def make_mjx_env(xml_path: str,
         obs = obs_from_dd(dd)
         return (dd, obs, jnp.array(False), zero_ctrl), obs
 
+    def upright_from_quat(q: jnp.ndarray) -> jnp.ndarray:
+        """쿼터니언으로부터 몸체가 얼마나 수직으로 서 있는지를 계산합니다."""
+        w, x, y, z = q[0], q[1], q[2], q[3]
+        return 1.0 - 2.0 * (x*x + y*y)
+
     def step_single(state, a_unit: jnp.ndarray):
+        """단일 환경의 한 스텝을 진행하고 보상과 종료 여부를 계산합니다."""
         dd, _, done_prev, _ = state
         ctrl = scale_action(a_unit)
 
@@ -137,29 +135,37 @@ def make_mjx_env(xml_path: str,
         obs = obs_from_dd(dd)
         
         forward_speed = (dd.qvel[fwd_idx] * fwd_sign).astype(jnp.float32)
+        base_z = dd.qpos[2].astype(jnp.float32)
+        up = jnp.clip(upright_from_quat(dd.qpos[3:7]), 0.0, 1.0)
+
+        stand_gate = jnp.logical_and(base_z > 0.27, up > 0.8)
+
         reward_forward = jnp.minimum(forward_speed, tgt_speed)
         overspeed = jnp.maximum(forward_speed - tgt_speed, 0.0)
         overspeed_pen = over_w * (overspeed ** 2)
-        ctrl_cost = ctrl_cost_weight * jnp.sum(jnp.square(ctrl))
-        
-        contact = dd._impl.contact
-        g1, g2 = contact.geom1, contact.geom2
-        ids = non_foot_geom_ids_jnp
-        is_nonfoot = ((g1[:, None] == ids[None, :]).any(axis=1) | 
-                      (g2[:, None] == ids[None, :]).any(axis=1))
-        is_ground = (g1 == ground_id) | (g2 == ground_id)
-        valid = jnp.arange(g1.shape[0], dtype=jnp.int32) < dd._impl.ncon
-        num_bad_contacts = jnp.sum(is_nonfoot & is_ground & valid)
-        contact_penalty = contact_penalty_weight * num_bad_contacts.astype(jnp.float32)
-        
-        torso_angular_velocity = dd.qvel[3:5]
-        tilt_penalty = tilt_penalty_weight * jnp.sum(jnp.square(torso_angular_velocity))
+        speed_term = jnp.where(stand_gate, reward_forward - overspeed_pen, 0.0)
 
-        reward = alive_bonus + reward_forward - overspeed_pen - ctrl_cost - contact_penalty - tilt_penalty
-        
-        z = dd.qpos[2]
+        height_term = jnp.clip((base_z - 0.25) / 0.07, 0.0, 1.0)
+        upright_term = jnp.clip((up - 0.6) / 0.2, 0.0, 1.0)
+        stand_shape = 0.5 * (height_term + upright_term)
+
+        ctrl_cost = ctrl_cost_weight * jnp.sum(jnp.square(ctrl))
+        tilt_pen = tilt_penalty_weight * (1.0 - up)
+
+        # [수정됨] alive_bonus 대신 stand_bonus를, 0.3 대신 stand_shape_weight를 사용
+        reward = (
+            stand_bonus
+            + stand_shape_weight * stand_shape
+            + speed_term
+            - tilt_pen
+            - ctrl_cost
+        )
+
         isnan = jnp.any(jnp.isnan(dd.qpos)) | jnp.any(jnp.isnan(dd.qvel))
-        done_now = jnp.logical_or(isnan, z < z_threshold)
+        done_now = jnp.logical_or(
+            isnan,
+            jnp.logical_or(base_z < z_threshold, up < 0.2)
+        )
         done = jnp.logical_or(done_prev, done_now)
 
         new_state = (dd, obs, done, ctrl)
@@ -175,6 +181,7 @@ def make_mjx_env(xml_path: str,
 # 2. 정책 정의 및 ARS 학습 루프
 # ==============================================================================
 def make_policy_fns(obs_dim: int, act_dim: int) -> Tuple[Callable, Callable]:
+    """선형 정책 함수를 생성합니다."""
     params_pytree_shape = (jnp.zeros((obs_dim, act_dim)), jnp.zeros((act_dim,)))
     def ravel_pytree_partial(pytree): return ravel_pytree(pytree)[0]
     _, unravel_fn = ravel_pytree(params_pytree_shape)
@@ -185,17 +192,19 @@ def make_policy_fns(obs_dim: int, act_dim: int) -> Tuple[Callable, Callable]:
     return ravel_pytree_partial, policy_apply_fn
 
 def ars_train(xml_path: str, **kwargs):
+    """ARS 알고리즘으로 정책을 학습합니다."""
     seed, num_envs, episode_length = kwargs['seed'], kwargs['num_envs'], kwargs['episode_length']
     
-    # 학습 시작 시 설정 로그 출력
     steps_per_iter = (2 * kwargs["num_dirs"] * kwargs["num_envs"] * kwargs["episode_length"] * kwargs["action_repeat"])
     print(f"[Config] steps/iter ≈ {steps_per_iter:,}  | dir_chunk={kwargs.get('dir_chunk')}")
 
+    # [수정됨] make_mjx_env에 전달할 인자 목록 업데이트
+    env_params_keys = ['action_repeat', 'z_threshold', 'ctrl_cost_weight', 
+                       'tilt_penalty_weight', 'forward_axis', 'forward_sign', 
+                       'target_speed', 'overspeed_weight', 'stand_bonus', 'stand_shape_weight']
     reset_batch, step_batch, info = make_mjx_env(
         xml_path=xml_path, 
-        **{k: kwargs[k] for k in ['action_repeat', 'z_threshold', 'ctrl_cost_weight', 'alive_bonus',
-                                  'contact_penalty_weight', 'tilt_penalty_weight', 'forward_axis', 
-                                  'forward_sign', 'target_speed', 'overspeed_weight']}
+        **{k: kwargs[k] for k in env_params_keys}
     )
     obs_dim, act_dim = info["obs_dim"], info["act_dim"]
     key = random.PRNGKey(seed)
@@ -216,6 +225,7 @@ def ars_train(xml_path: str, **kwargs):
 
     @jax.jit
     def rollout_return(theta_: jnp.ndarray, keys: jnp.ndarray) -> jnp.ndarray:
+        """주어진 정책 파라미터로 롤아웃을 실행하고 누적 보상을 반환합니다."""
         state, obs = reset_batch(keys)
         def body(carry, _):
             st, ob, ret = carry
@@ -226,6 +236,7 @@ def ars_train(xml_path: str, **kwargs):
         return returns
 
     def make_eval_chunk_fn(rollout_return_fn, noise_std):
+        """메모리 관리를 위해 델타(탐색 방향)를 청크 단위로 평가하는 함수를 생성합니다."""
         @jax.jit
         def eval_chunk(theta_, deltas_chunk, keys_chunk):
             def eval_one(delta, keys):
@@ -274,24 +285,30 @@ def ars_train(xml_path: str, **kwargs):
             print(f"\n[Iter {global_it+1}] Eval Return: {float(ret):.2f}")
         
         if (global_it + 1) % ckpt_every == 0 or it_local == total_new_iters - 1:
+            # [수정됨] 체크포인트 메타데이터에 새 인자 추가
+            meta_keys = ["xml_path", "forward_axis", "forward_sign", "target_speed", 
+                         "overspeed_weight", "stand_bonus", "stand_shape_weight"]
             save_checkpoint(
                 kwargs["save_path"], theta=theta, key=key, it=global_it + 1,
                 obs_dim=obs_dim, act_dim=act_dim, 
-                meta={k: kwargs.get(k) for k in ["xml_path", "forward_axis", "forward_sign", "target_speed", "overspeed_weight"]},
+                meta={k: kwargs.get(k) for k in meta_keys},
             )
 
 # ==============================================================================
-# 3. 추론 및 시각화
+# 3. 추론
 # ==============================================================================
 def run_inference(xml_path: str, ckpt_path: str, **kwargs):
+    """학습된 정책으로 추론을 실행합니다."""
     ckpt = load_checkpoint(ckpt_path)
     if ckpt is None: raise FileNotFoundError(f"Checkpoint not found at {ckpt_path}")
     theta, obs_dim, act_dim = ckpt["theta"], ckpt["obs_dim"], ckpt["act_dim"]
     _, policy_apply = make_policy_fns(obs_dim, act_dim)
     
-    env_params = {k: kwargs[k] for k in ['action_repeat', 'z_threshold', 'ctrl_cost_weight', 'alive_bonus',
-                                         'contact_penalty_weight', 'tilt_penalty_weight', 'forward_axis', 
-                                         'forward_sign', 'target_speed', 'overspeed_weight']}
+    # [수정됨] make_mjx_env에 전달할 인자 목록 업데이트
+    env_params_keys = ['action_repeat', 'z_threshold', 'ctrl_cost_weight', 
+                       'tilt_penalty_weight', 'forward_axis', 'forward_sign', 
+                       'target_speed', 'overspeed_weight', 'stand_bonus', 'stand_shape_weight']
+    env_params = {k: kwargs[k] for k in env_params_keys}
     reset_batch, step_batch, _ = make_mjx_env(xml_path=xml_path, **env_params)
     
     keys = random.split(random.PRNGKey(kwargs['seed']), kwargs['num_envs'])
@@ -304,93 +321,55 @@ def run_inference(xml_path: str, ckpt_path: str, **kwargs):
     (_, _, returns), _ = lax.scan(body, (state, obs, jnp.zeros(kwargs['num_envs'], dtype=jnp.float32)), None, length=kwargs['episode_length'])
     print(f"Inference mean return: {float(jnp.mean(returns)):.2f}")
 
-def run_viewer(xml_path: str, ckpt_path: str, action_repeat: int):
-    try:
-        from mujoco import viewer as mj_viewer
-    except Exception as e:
-        raise RuntimeError("MuJoCo viewer 모듈을 찾을 수 없습니다. 'pip install -U mujoco glfw' 후 재시도하세요.") from e
-
-    ckpt = load_checkpoint(ckpt_path)
-    if ckpt is None: raise FileNotFoundError(f"Checkpoint not found at {ckpt_path}")
-    theta, obs_dim, act_dim = np.array(ckpt["theta"]), ckpt["obs_dim"], ckpt["act_dim"]
-    w_size = obs_dim * act_dim
-    W, B = theta[:w_size].reshape(obs_dim, act_dim), theta[w_size:]
-    m = mujoco.MjModel.from_xml_path(xml_path)
-    d = mujoco.MjData(m)
-    ctrl_center = (m.actuator_ctrlrange[:, 0] + m.actuator_ctrlrange[:, 1]) / 2.0
-    ctrl_half = (m.actuator_ctrlrange[:, 1] - m.actuator_ctrlrange[:, 0]) / 2.0
-    def obs_from_md(data): return np.concatenate([data.qpos[7:], data.qvel])
-    def scale_action_np(a_unit): return ctrl_center + ctrl_half * np.tanh(a_unit)
-    def reset_env():
-        mujoco.mj_resetData(m, d)
-        noise = 0.01 * np.random.randn(d.qpos.shape[0])
-        noise[:7] = 0.0
-        d.qpos[:] += noise
-        mujoco.mj_forward(m, d)
-    reset_env()
-    with mj_viewer.launch_passive(m, d) as v:
-        def key_callback(keycode):
-            if keycode in (ord('R'), ord('r')): reset_env()
-        v.user_key_callback = key_callback
-        while v.is_running():
-            step_start = time.time()
-            obs = obs_from_md(d)
-            a_unit = np.tanh(obs @ W + B)
-            d.ctrl[:] = scale_action_np(a_unit)
-            for _ in range(action_repeat): mujoco.mj_step(m, d)
-            v.sync()
-            time_until_next_step = m.opt.timestep * action_repeat - (time.time() - step_start)
-            if time_until_next_step > 0: time.sleep(time_until_next_step)
 
 # ==============================================================================
 # 4. 스크립트 실행 메인 블록
 # ==============================================================================
 def parse_args():
-    p = argparse.ArgumentParser(description="MJX + ARS trainer/viewer for quadruped")
+    """스크립트 실행을 위한 인자들을 파싱합니다."""
+    p = argparse.ArgumentParser(description="Headless-only MJX + ARS trainer for quadruped")
     p.add_argument("--xml", type=str, required=True, dest="xml_path")
-    p.add_argument("--infer", action="store_true")
-    p.add_argument("--view", action="store_true")
-    p.add_argument("--resume", action="store_true")
+    p.add_argument("--infer", action="store_true", help="추론 모드로 실행")
+    p.add_argument("--resume", action="store_true", help="저장된 체크포인트에서 학습 재개")
     p.add_argument("--seed", type=int, default=0)
-    # H100 추천 기본값
-    p.add_argument("--num-envs", type=int, default=512)
-    p.add_argument("--num-dirs", type=int, default=64)
-    p.add_argument("--top-dirs", type=int, default=16)
+    # 학습 파라미터
+    p.add_argument("--num-envs", type=int, default=256)
+    p.add_argument("--num-dirs", type=int, default=16)
+    p.add_argument("--top-dirs", type=int, default=4)
     p.add_argument("--episode-length", type=int, default=300)
     p.add_argument("--action-repeat", type=int, default=2)
-    p.add_argument("--iterations", type=int, default=1000)
-    p.add_argument("--dir-chunk", type=int, default=32, help="num_dirs를 나눠 평가할 chunk 크기")
-    p.add_argument("--step-size", type=float, default=0.02)
-    p.add_argument("--noise-std", type=float, default=0.03)
-    p.add_argument("--z-threshold", type=float, default=0.25)
+    p.add_argument("--iterations", type=int, default=400)
+    p.add_argument("--dir-chunk", type=int, default=16, help="num_dirs를 나눠 평가할 chunk 크기")
+    p.add_argument("--step-size", type=float, default=0.015)
+    p.add_argument("--noise-std", type=float, default=0.025)
+    # 환경 및 보상 파라미터
+    p.add_argument("--z-threshold", type=float, default=0.25, help="에피소드 종료 높이 임계값")
     p.add_argument("--ctrl-cost-weight", type=float, default=1e-4)
-    p.add_argument("--alive-bonus", type=float, default=0.05)
-    p.add_argument("--contact-penalty-weight", type=float, default=2e-3)
-    p.add_argument("--tilt-penalty-weight", type=float, default=1e-3)
+    p.add_argument("--tilt-penalty-weight", type=float, default=1e-3, help="몸체 기울기 패널티 가중치")
     p.add_argument("--forward-axis", choices=["x", "y", "z"], default="x")
     p.add_argument("--forward-sign", type=int, choices=[-1, 1], default=1)
     p.add_argument("--target-speed", type=float, default=0.5)
     p.add_argument("--overspeed-weight", type=float, default=1.0)
+    # [새로 추가/수정된 인자]
+    p.add_argument("--stand-bonus", type=float, default=0.05, help="서 있을 때 받는 기본 보너스 (기존 alive_bonus 대체)")
+    p.add_argument("--stand-shape-weight", type=float, default=0.3, help="일어서기 자세 유도 보상(shaping) 가중치")
+    # 로깅 및 저장
     p.add_argument("--eval-every", type=int, default=10)
     p.add_argument("--ckpt-every", type=int, default=10)
     p.add_argument("--save-path", type=str, default="ars_policy.npz")
-    p.add_argument("--gl-backend", type=str, choices=["egl", "glfw", "osmesa"], default=None)
+    
+    # contact_penalty_weight는 현재 보상 함수에서 사용되지 않으므로 인자 목록에서 제거
+    # p.add_argument("--contact-penalty-weight", type=float, default=2e-3)
+    
     return p.parse_args()
 
 if __name__ == "__main__":
     args = parse_args()
-    if args.view:
-        os.environ["MUJOCO_GL"] = "glfw"
-    else:
-        os.environ["MUJOCO_GL"] = args.gl_backend or os.environ.get("MUJOCO_GL", "egl")
     
-    # H100 환경에서는 셸에서 XLA_PYTHON_CLIENT_PREALLOCATE=true로 설정하는 것을 권장하므로,
-    # 이 라인은 주석 처리하거나 삭제할 수 있습니다.
-    # os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+    os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
-    if args.view:
-        run_viewer(xml_path=args.xml_path, ckpt_path=args.save_path, action_repeat=args.action_repeat)
-    elif args.infer:
+    if args.infer:
         run_inference(xml_path=args.xml_path, ckpt_path=args.save_path, **vars(args))
     else:
+        # ars_train 호출 시 vars(args)를 통해 모든 인자가 딕셔너리로 전달됨
         ars_train(**vars(args))
