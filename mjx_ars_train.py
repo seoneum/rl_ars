@@ -69,15 +69,18 @@ def load_checkpoint(path):
 # ==============================================================================
 def make_mjx_env(xml_path: str,
                  action_repeat: int = 4,
-                 z_threshold: float = 0.25,
+                 z_threshold: float = 0.45,
                  ctrl_cost_weight: float = 1e-3,
                  tilt_penalty_weight: float = 1e-3,
                  forward_axis: str = "x",
-                 forward_sign: int = 1,
-                 target_speed: float = 0.3,
+                 forward_sign: int = -1,
+                 target_speed: float = 0.1,
                  overspeed_weight: float = 0.5,
                  stand_bonus: float = 0.1,
-                 stand_shape_weight: float = 0.3
+                 stand_shape_weight: float = 0.3,
+                 # [수정 4] stand_gate 임계값을 인자로 받도록 추가
+                 stand_gate_z: float = 0.27,
+                 stand_gate_up: float = 0.80
                  ):
     m = mujoco.MjModel.from_xml_path(xml_path)
     mm = mjx.put_model(m)
@@ -138,7 +141,8 @@ def make_mjx_env(xml_path: str,
         base_z = dd.qpos[2].astype(jnp.float32)
         up = jnp.clip(upright_from_quat(dd.qpos[3:7]), 0.0, 1.0)
 
-        stand_gate = jnp.logical_and(base_z > 0.27, up > 0.8)
+        # [수정 4] 하드코딩된 값을 인자로 받은 stand_gate_z, stand_gate_up으로 교체
+        stand_gate = jnp.logical_and(base_z > stand_gate_z, up > stand_gate_up)
 
         reward_forward = jnp.minimum(forward_speed, tgt_speed)
         overspeed = jnp.maximum(forward_speed - tgt_speed, 0.0)
@@ -152,7 +156,6 @@ def make_mjx_env(xml_path: str,
         ctrl_cost = ctrl_cost_weight * jnp.sum(jnp.square(ctrl))
         tilt_pen = tilt_penalty_weight * (1.0 - up)
 
-        # [수정됨] alive_bonus 대신 stand_bonus를, 0.3 대신 stand_shape_weight를 사용
         reward = (
             stand_bonus
             + stand_shape_weight * stand_shape
@@ -198,10 +201,11 @@ def ars_train(xml_path: str, **kwargs):
     steps_per_iter = (2 * kwargs["num_dirs"] * kwargs["num_envs"] * kwargs["episode_length"] * kwargs["action_repeat"])
     print(f"[Config] steps/iter ≈ {steps_per_iter:,}  | dir_chunk={kwargs.get('dir_chunk')}")
 
-    # [수정됨] make_mjx_env에 전달할 인자 목록 업데이트
+    # [수정 4] make_mjx_env에 전달할 인자 목록에 stand_gate_z, stand_gate_up 추가
     env_params_keys = ['action_repeat', 'z_threshold', 'ctrl_cost_weight', 
                        'tilt_penalty_weight', 'forward_axis', 'forward_sign', 
-                       'target_speed', 'overspeed_weight', 'stand_bonus', 'stand_shape_weight']
+                       'target_speed', 'overspeed_weight', 'stand_bonus', 
+                       'stand_shape_weight', 'stand_gate_z', 'stand_gate_up']
     reset_batch, step_batch, info = make_mjx_env(
         xml_path=xml_path, 
         **{k: kwargs[k] for k in env_params_keys}
@@ -232,7 +236,8 @@ def ars_train(xml_path: str, **kwargs):
             act = policy_apply(theta_, ob)
             st, (ob_next, r, done) = step_batch(st, act)
             return (st, ob_next, ret + r * (1.0 - done)), None
-        (_, _, returns), _ = lax.scan(body, (state, obs, jnp.zeros(num_envs)), None, length=episode_length)
+        # [개선 2] XLA의 안정적인 연산을 위해 lax.scan 초기값에 dtype 명시
+        (_, _, returns), _ = lax.scan(body, (state, obs, jnp.zeros(num_envs, dtype=jnp.float32)), None, length=episode_length)
         return returns
 
     def make_eval_chunk_fn(rollout_return_fn, noise_std):
@@ -276,7 +281,13 @@ def ars_train(xml_path: str, **kwargs):
         weighted = (R_plus_top - R_minus_top)[:, None] * deltas_top
         grad_est = jnp.mean(weighted, axis=0) / reward_std
         theta += kwargs["step_size"] * grad_est
-        pbar.set_postfix({"mean+": f"{R_plus.mean():.2f}", "mean-": f"{R_minus.mean():.2f}", "best": f"{scores.max():.2f}"})
+        
+        # [수정 2] tqdm 진행률 표시줄에 JAX 배열 포맷팅 오류 수정 (float()으로 감싸기)
+        pbar.set_postfix({
+            "mean+": f"{float(jnp.mean(R_plus)):.2f}",
+            "mean-": f"{float(jnp.mean(R_minus)):.2f}",
+            "best": f"{float(jnp.max(scores)):.2f}",
+        })
 
         if (global_it + 1) % kwargs["eval_every"] == 0 or it_local == total_new_iters - 1:
             key, k_eval = random.split(key)
@@ -285,9 +296,10 @@ def ars_train(xml_path: str, **kwargs):
             print(f"\n[Iter {global_it+1}] Eval Return: {float(ret):.2f}")
         
         if (global_it + 1) % ckpt_every == 0 or it_local == total_new_iters - 1:
-            # [수정됨] 체크포인트 메타데이터에 새 인자 추가
+            # [수정 4] 체크포인트 메타데이터에 새 인자 추가
             meta_keys = ["xml_path", "forward_axis", "forward_sign", "target_speed", 
-                         "overspeed_weight", "stand_bonus", "stand_shape_weight"]
+                         "overspeed_weight", "stand_bonus", "stand_shape_weight",
+                         "stand_gate_z", "stand_gate_up"]
             save_checkpoint(
                 kwargs["save_path"], theta=theta, key=key, it=global_it + 1,
                 obs_dim=obs_dim, act_dim=act_dim, 
@@ -304,10 +316,11 @@ def run_inference(xml_path: str, ckpt_path: str, **kwargs):
     theta, obs_dim, act_dim = ckpt["theta"], ckpt["obs_dim"], ckpt["act_dim"]
     _, policy_apply = make_policy_fns(obs_dim, act_dim)
     
-    # [수정됨] make_mjx_env에 전달할 인자 목록 업데이트
+    # [수정 4] make_mjx_env에 전달할 인자 목록에 stand_gate_z, stand_gate_up 추가
     env_params_keys = ['action_repeat', 'z_threshold', 'ctrl_cost_weight', 
                        'tilt_penalty_weight', 'forward_axis', 'forward_sign', 
-                       'target_speed', 'overspeed_weight', 'stand_bonus', 'stand_shape_weight']
+                       'target_speed', 'overspeed_weight', 'stand_bonus', 
+                       'stand_shape_weight', 'stand_gate_z', 'stand_gate_up']
     env_params = {k: kwargs[k] for k in env_params_keys}
     reset_batch, step_batch, _ = make_mjx_env(xml_path=xml_path, **env_params)
     
@@ -318,6 +331,7 @@ def run_inference(xml_path: str, ckpt_path: str, **kwargs):
         act = policy_apply(theta, ob)
         st, (ob_next, r, done) = step_batch(st, act)
         return (st, ob_next, ret + r * (1.0 - done)), None
+    # [개선 2] 추론 시에도 lax.scan 초기값에 dtype 명시
     (_, _, returns), _ = lax.scan(body, (state, obs, jnp.zeros(kwargs['num_envs'], dtype=jnp.float32)), None, length=kwargs['episode_length'])
     print(f"Inference mean return: {float(jnp.mean(returns)):.2f}")
 
@@ -333,43 +347,49 @@ def parse_args():
     p.add_argument("--resume", action="store_true", help="저장된 체크포인트에서 학습 재개")
     p.add_argument("--seed", type=int, default=0)
     # 학습 파라미터
-    p.add_argument("--num-envs", type=int, default=256)
-    p.add_argument("--num-dirs", type=int, default=16)
+    p.add_argument("--num-envs", type=int, default=128)
+    p.add_argument("--num-dirs", type=int, default=8)
     p.add_argument("--top-dirs", type=int, default=4)
     p.add_argument("--episode-length", type=int, default=300)
     p.add_argument("--action-repeat", type=int, default=2)
-    p.add_argument("--iterations", type=int, default=400)
+    p.add_argument("--iterations", type=int, default=1000)
     p.add_argument("--dir-chunk", type=int, default=16, help="num_dirs를 나눠 평가할 chunk 크기")
     p.add_argument("--step-size", type=float, default=0.015)
     p.add_argument("--noise-std", type=float, default=0.025)
     # 환경 및 보상 파라미터
-    p.add_argument("--z-threshold", type=float, default=0.25, help="에피소드 종료 높이 임계값")
+    p.add_argument("--z-threshold", type=float, default=0.35, help="에피소드 종료 높이 임계값")
     p.add_argument("--ctrl-cost-weight", type=float, default=1e-4)
     p.add_argument("--tilt-penalty-weight", type=float, default=1e-3, help="몸체 기울기 패널티 가중치")
     p.add_argument("--forward-axis", choices=["x", "y", "z"], default="x")
-    p.add_argument("--forward-sign", type=int, choices=[-1, 1], default=1)
+    # [개선 1] forward_sign 기본값을 -1 (후진)에서 1 (전진)으로 변경
+    p.add_argument("--forward-sign", type=int, choices=[-1, 1], default=-1)
     p.add_argument("--target-speed", type=float, default=0.5)
     p.add_argument("--overspeed-weight", type=float, default=1.0)
-    # [새로 추가/수정된 인자]
-    p.add_argument("--stand-bonus", type=float, default=0.05, help="서 있을 때 받는 기본 보너스 (기존 alive_bonus 대체)")
-    p.add_argument("--stand-shape-weight", type=float, default=0.3, help="일어서기 자세 유도 보상(shaping) 가중치")
+    p.add_argument("--stand-bonus", type=float, default=0.05, help="서 있을 때 받는 기본 보너스")
+    p.add_argument("--stand-shape-weight", type=float, default=0.3, help="일어서기 자세 유도 보상 가중치")
+    # [수정 4] stand_gate 임계값을 인자로 추가
+    p.add_argument("--stand-gate-z", type=float, default=0.27, help="속도 보상 활성화 z높이 임계값")
+    p.add_argument("--stand-gate-up", type=float, default=0.80, help="속도 보상 활성화 수직 임계값")
     # 로깅 및 저장
     p.add_argument("--eval-every", type=int, default=10)
     p.add_argument("--ckpt-every", type=int, default=10)
     p.add_argument("--save-path", type=str, default="ars_policy.npz")
-    
-    # contact_penalty_weight는 현재 보상 함수에서 사용되지 않으므로 인자 목록에서 제거
-    # p.add_argument("--contact-penalty-weight", type=float, default=2e-3)
     
     return p.parse_args()
 
 if __name__ == "__main__":
     args = parse_args()
     
-    os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+    # [수정 3] jax import 이후에 호출되어 효과가 없는 환경 변수 설정 제거 (env.sh로 관리 권장)
+    # os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
+    # [수정 1] run_inference 호출 시 중복 인자 전달 버그 수정
     if args.infer:
-        run_inference(xml_path=args.xml_path, ckpt_path=args.save_path, **vars(args))
+        kwargs = vars(args).copy()
+        xml = kwargs.pop("xml_path")
+        ckpt = kwargs.pop("save_path")
+        kwargs.pop("infer", None)  # 사용하지 않는 플래그 제거
+        kwargs.pop("resume", None) # 추론에 불필요한 플래그 제거
+        run_inference(xml_path=xml, ckpt_path=ckpt, **kwargs)
     else:
-        # ars_train 호출 시 vars(args)를 통해 모든 인자가 딕셔너리로 전달됨
         ars_train(**vars(args))
