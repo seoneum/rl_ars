@@ -75,7 +75,7 @@ def make_mjx_env(xml_path: str, **kwargs):
     ctrl_center = (ctrl_low + ctrl_high) / 2.0
     ctrl_half = (ctrl_high - ctrl_low) / 2.0
 
-    # --- [신규] 무릎 관절 탐색 및 정보 수집 ---
+    # --- 무릎 관절 자동 탐색 및 정보 수집 ---
     knee_patterns = kwargs.get('knee_patterns', 'knee')
     pat_list = [s.strip() for s in knee_patterns.split(",") if s.strip()]
     knee_jids = []
@@ -86,16 +86,14 @@ def make_mjx_env(xml_path: str, **kwargs):
             if m.jnt_type[jid] in (mujoco.mjtJoint.mjJNT_HINGE, mujoco.mjtJoint.mjJNT_SLIDE):
                 knee_jids.append(jid)
 
-    # 로컬 파이썬 numpy를 사용하여 JAX로 전달할 배열 생성
     import numpy as _np
     knee_jids = _np.array(knee_jids, dtype=_np.int32)
     knee_qadr = jnp.array(m.jnt_qposadr[knee_jids], dtype=jnp.int32) if knee_jids.size > 0 else jnp.zeros((0,), dtype=jnp.int32)
     knee_min = jnp.array(m.jnt_range[knee_jids, 0], dtype=jnp.float32) if knee_jids.size > 0 else jnp.zeros((0,), dtype=jnp.float32)
     knee_max = jnp.array(m.jnt_range[knee_jids, 1], dtype=jnp.float32) if knee_jids.size > 0 else jnp.zeros((0,), dtype=jnp.float32)
     knee_span = jnp.maximum(knee_max - knee_min, 1e-6)
-    # --- 무릎 관절 탐색 끝 ---
 
-    # JIT 컴파일을 위해 kwargs에서 파라미터를 추출하여 JAX 타입으로 변환
+    # --- JIT 컴파일을 위한 파라미터 추출 및 캐스팅 ---
     action_repeat = int(kwargs.get('action_repeat', 3))
     z_th = jnp.float32(kwargs.get('z_threshold', 0.32))
     ctrl_w = jnp.float32(kwargs.get('ctrl_cost_weight', 2e-4))
@@ -115,8 +113,9 @@ def make_mjx_env(xml_path: str, **kwargs):
     base_w = jnp.float32(kwargs.get('base_vel_penalty_weight', 0.02))
     st_w = jnp.float32(kwargs.get('streak_weight', 0.01))
     st_scale = jnp.float32(kwargs.get('streak_scale', 60.0))
+    z_pen_w = jnp.float32(kwargs.get('z_over_penalty', 0.06)) # [신규] z-밴드 패널티 가중치
 
-    # [신규] 무릎 및 초기 자세 관련 파라미터 스칼라 캐스팅
+    # 초기 자세 및 무릎 관련 파라미터
     crouch_r = jnp.float32(kwargs.get('crouch_init_ratio', 0.20))
     crouch_n = jnp.float32(kwargs.get('crouch_init_noise', 0.03))
     pitch0   = jnp.float32(kwargs.get('init_pitch', -0.12))
@@ -138,27 +137,23 @@ def make_mjx_env(xml_path: str, **kwargs):
     def reset_single(key: jax.Array) -> Tuple[Tuple[Any, ...], jnp.ndarray]:
         dd = mjx.make_data(mm)
         k1, k2 = random.split(key)
-        # 일반 관절에 대한 노이즈
         noise_all = 0.01 * random.normal(k1, (qpos0.shape[0],), dtype=jnp.float32)
         qpos = qpos0 + noise_all.at[:7].set(0.0)
 
-        # [신규] 무릎 관절을 지정된 앉은 자세로 강제 초기화
+        # 무릎 관절을 지정된 앉은 자세로 강제 초기화
         if knee_qadr.shape[0] > 0:
             knee_noise = crouch_n * random.normal(k2, (knee_qadr.shape[0],), dtype=jnp.float32)
             knee_target = knee_min + crouch_r * knee_span + knee_noise * knee_span
             qpos = qpos.at[knee_qadr].set(knee_target)
 
-        # [신규] 몸통 pitch(자유관절 quaternion: [w,x,y,z]) – y축 회전
-        # pitch0(rad): 앞쪽으로 숙임이면 음수
+        # 몸통 pitch(y축 회전)를 적용하여 앞으로 숙인 자세로 초기화
         half = 0.5 * pitch0
-        q_w = jnp.cos(half)
-        q_y = jnp.sin(half)
+        q_w, q_y = jnp.cos(half), jnp.sin(half)
         qpos = qpos.at[3:7].set(jnp.array([q_w, 0.0, q_y, 0.0], dtype=jnp.float32))
 
         dd = replace(dd, qpos=qpos, qvel=zero_qvel, ctrl=zero_ctrl)
         obs = obs_from_dd(dd)
         streak0 = jnp.array(0.0, dtype=jnp.float32)
-        # 상태 튜플 구조에 맞게 반환
         return (dd, obs, jnp.array(False, dtype=jnp.bool_), zero_ctrl, streak0), obs
 
     def upright_from_quat(q: jnp.ndarray) -> jnp.ndarray:
@@ -188,10 +183,12 @@ def make_mjx_env(xml_path: str, **kwargs):
         dd = lax.cond(done_prev, lambda d: d, integrate_if_alive, dd)
         obs = obs_from_dd(dd)
 
+        # --- 상태 변수 추출 ---
         base_z = dd.qpos[2].astype(jnp.float32)
         up = jnp.clip(upright_from_quat(dd.qpos[3:7]), 0.0, 1.0)
         forward_speed = (dd.qvel[fwd_idx] * fsign).astype(jnp.float32)
 
+        # --- 보상 요소 계산 ---
         z_band = band_parabola(base_z, z_lo, z_hi)
         up_band = band_parabola(up, up_min, 0.98)
         stand_shape = 0.5 * (z_band + up_band)
@@ -205,11 +202,10 @@ def make_mjx_env(xml_path: str, **kwargs):
         streak_next = jnp.where(is_standing_now, streak + 1.0, 0.0)
         streak_reward = st_w * jnp.tanh(streak_next / st_scale)
 
-        # [신규] 무릎 밴드 보상 및 패널티 계산
         if knee_qadr.shape[0] > 0:
             knee_q = dd.qpos[knee_qadr]
-            knee_ratio = jnp.clip((knee_q - knee_min) / knee_span, 0.0, 1.0) # 0~1
-            knee_band_score = band_parabola(knee_ratio, knee_lo, knee_hi) # 각 무릎 0~1
+            knee_ratio = jnp.clip((knee_q - knee_min) / knee_span, 0.0, 1.0)
+            knee_band_score = band_parabola(knee_ratio, knee_lo, knee_hi)
             knee_band_mean = jnp.mean(knee_band_score)
             under = jnp.clip(knee_lo - knee_ratio, 0.0, 1.0)
             over  = jnp.clip(knee_ratio - knee_hi, 0.0, 1.0)
@@ -218,25 +214,28 @@ def make_mjx_env(xml_path: str, **kwargs):
             knee_band_mean = jnp.float32(0.0)
             knee_out_pen   = jnp.float32(0.0)
 
+        # --- 패널티 요소 계산 ---
         ctrl_cost = ctrl_w * jnp.sum(jnp.square(ctrl))
         tilt_pen = tilt_w * (1.0 - up)
         ang_pen = ang_w * jnp.sum(jnp.square(dd.qvel[3:5].astype(jnp.float32)))
         act_pen = actdw * jnp.sum(jnp.square(ctrl - prev_ctrl))
 
-        mask_xy = jnp.array([1.0, 1.0], dtype=jnp.float32)
-        mask_xy = lax.cond((fwd_idx < 2), lambda m: m.at[fwd_idx].set(0.0), lambda m: m, mask_xy)
+        mask_xy = jnp.array([1.0, 1.0], dtype=jnp.float32).at[fwd_idx].set(0.0)
         lin_xy = dd.qvel[0:2].astype(jnp.float32) * mask_xy
         base_ang = dd.qvel[3:5].astype(jnp.float32)
         base_pen = base_w * (jnp.sum(jnp.square(lin_xy)) + jnp.sum(jnp.square(base_ang)))
 
-        # 최종 보상에 무릎 관련 항목 추가
-        reward = (stand_b
-                  + stand_w * stand_shape
-                  + streak_reward
-                  + speed_term
-                  + knee_w * knee_band_mean  # 무릎 밴드 보상
-                  - (tilt_pen + ang_pen + base_pen + act_pen + ctrl_cost + knee_pen * knee_out_pen)) # 무릎 밴드 밖 패널티
+        # [신규] z-밴드 밖 패널티 (거리 제곱 기반)
+        under_z = jnp.clip(z_lo - base_z, 0.0, 1e9)
+        over_z  = jnp.clip(base_z - z_hi, 0.0, 1e9)
+        z_span = jnp.maximum(z_hi - z_lo, 1e-6) # 정규화
+        z_out_pen = (under_z / z_span)**2 + (over_z / z_span)**2
 
+        # --- 최종 보상 결합 ---
+        reward = (stand_b + stand_w * stand_shape + streak_reward + speed_term + knee_w * knee_band_mean
+                  - (tilt_pen + ang_pen + base_pen + act_pen + ctrl_cost + knee_pen * knee_out_pen + z_pen_w * z_out_pen))
+
+        # --- 종료 조건 ---
         isnan = jnp.any(jnp.isnan(dd.qpos)) | jnp.any(jnp.isnan(dd.qvel))
         done_now = jnp.logical_or(isnan, jnp.logical_or(base_z < z_th, up < 0.2))
         done = jnp.logical_or(done_prev, done_now)
@@ -246,7 +245,10 @@ def make_mjx_env(xml_path: str, **kwargs):
 
     reset_batch = jax.jit(jax.vmap(reset_single))
     step_batch = jax.jit(jax.vmap(step_single))
-    env_info = {"obs_dim": int(nq - 7 + nv), "act_dim": int(nu)}
+    env_info = {
+        "obs_dim": int(nq - 7 + nv), "act_dim": int(nu),
+        "knee_qadr": knee_qadr, "knee_min": knee_min, "knee_span": knee_span
+    }
     return reset_batch, step_batch, env_info
 
 # ==============================================================================
@@ -273,13 +275,13 @@ def ars_train(xml_path: str, **kwargs):
         'stand_bonus','stand_shape_weight','speed_weight',
         'target_z_low','target_z_high','upright_min',
         'angvel_penalty_weight','act_delta_weight','base_vel_penalty_weight',
-        'streak_weight','streak_scale',
-        # [신규] 무릎 및 초기 자세 관련 인자 추가
+        'streak_weight','streak_scale','z_over_penalty',
         'knee_patterns','crouch_init_ratio','crouch_init_noise','init_pitch',
         'knee_band_low','knee_band_high','knee_band_weight','knee_over_penalty',
     ]
     reset_batch, step_batch, info = make_mjx_env(xml_path=xml_path, **{k: kwargs[k] for k in env_params_keys})
     obs_dim, act_dim = info["obs_dim"], info["act_dim"]
+    knee_qadr, knee_min, knee_span = info["knee_qadr"], info["knee_min"], info["knee_span"]
 
     key = random.PRNGKey(seed)
     ravel, policy_apply = make_policy_fns(obs_dim, act_dim)
@@ -313,23 +315,31 @@ def ars_train(xml_path: str, **kwargs):
     def eval_stats(theta_: jnp.ndarray, keys_: jnp.ndarray):
         state, obs = reset_batch(keys_)
         def body(carry, _):
-            st, ob, ret, sum_up, sum_z, alive_steps = carry
+            st, ob, ret, sum_up, sum_z, sum_knee, alive_steps = carry
             dd = st[0]
             qpos = dd.qpos
             z = qpos[:, 2].astype(jnp.float32)
             q = qpos[:, 3:7]
             up = jnp.clip(1.0 - 2.0 * (q[:, 1]**2 + q[:, 2]**2), 0.0, 1.0)
+            
+            knee_ratio_mean = jnp.float32(0.0)
+            if knee_qadr.shape[0] > 0:
+                kq = qpos[:, knee_qadr]
+                kr = jnp.clip((kq - knee_min) / knee_span, 0.0, 1.0)
+                knee_ratio_mean = jnp.mean(kr, axis=-1)
+
             act = policy_apply(theta_, ob)
             st2, (ob_next, r, done) = step_batch(st, act)
             is_alive = (1.0 - done)
-            return (st2, ob_next, ret + r*is_alive, sum_up + up*is_alive, sum_z + z*is_alive, alive_steps + is_alive), None
+            return (st2, ob_next, ret + r*is_alive, sum_up + up*is_alive, sum_z + z*is_alive, sum_knee + knee_ratio_mean*is_alive, alive_steps + is_alive), None
 
-        init = (state, obs, *[jnp.zeros(num_envs, jnp.float32) for _ in range(4)])
-        (_, _, returns, sum_up, sum_z, alive_steps), _ = lax.scan(body, init, None, length=episode_length)
+        init = (state, obs, *[jnp.zeros(num_envs, jnp.float32) for _ in range(5)])
+        (_, _, returns, sum_up, sum_z, sum_knee, alive_steps), _ = lax.scan(body, init, None, length=episode_length)
         total_alive_steps = jnp.maximum(jnp.sum(alive_steps), 1.0)
         mean_up = jnp.sum(sum_up) / total_alive_steps
         mean_z  = jnp.sum(sum_z)  / total_alive_steps
-        return returns, mean_up, mean_z
+        mean_knee = jnp.sum(sum_knee) / total_alive_steps
+        return returns, mean_up, mean_z, mean_knee
 
     def make_eval_chunk_fn(rollout_return_fn, noise_std):
         @jax.jit
@@ -343,9 +353,7 @@ def ars_train(xml_path: str, **kwargs):
 
     eval_chunk = make_eval_chunk_fn(rollout_return, kwargs["noise_std"])
 
-    total_new_iters = kwargs["iterations"]
-    ckpt_every = kwargs["ckpt_every"] or kwargs["eval_every"]
-    pbar = trange(total_new_iters, desc=f"ARS training (start iter: {start_it})")
+    pbar = trange(kwargs["iterations"], desc=f"ARS training (start iter: {start_it})")
     for it_local in pbar:
         global_it = start_it + it_local
         key, k_delta, k_dirs = random.split(key, 3)
@@ -359,8 +367,7 @@ def ars_train(xml_path: str, **kwargs):
                 e = min(s + dir_chunk, kwargs["num_dirs"])
                 r_p, r_m = eval_chunk(theta, deltas[s:e], base_keys[s:e])
                 R_plus_list.append(r_p); R_minus_list.append(r_m)
-            R_plus = jnp.concatenate(R_plus_list, axis=0)
-            R_minus = jnp.concatenate(R_minus_list, axis=0)
+            R_plus, R_minus = jnp.concatenate(R_plus_list), jnp.concatenate(R_minus_list)
         else:
             R_plus, R_minus = eval_chunk(theta, deltas, base_keys)
 
@@ -371,38 +378,28 @@ def ars_train(xml_path: str, **kwargs):
         grad_est = jnp.mean((R_plus_top - R_minus_top)[:, None] * deltas_top, axis=0) / reward_std
         theta += kwargs["step_size"] * grad_est
 
-        pbar.set_postfix({
-            "mean+": f"{float(jnp.mean(R_plus)):.2f}",
-            "mean-": f"{float(jnp.mean(R_minus)):.2f}",
-            "best":  f"{float(jnp.max(scores)):.2f}",
-        })
+        pbar.set_postfix({"mean+": f"{R_plus.mean():.2f}", "mean-": f"{R_minus.mean():.2f}", "best": f"{scores.max():.2f}"})
 
-        if (global_it + 1) % kwargs["eval_every"] == 0 or it_local == total_new_iters - 1:
+        if (global_it + 1) % kwargs["eval_every"] == 0 or it_local == kwargs["iterations"] - 1:
             key, k_eval = random.split(key)
             eval_keys = random.split(k_eval, num_envs)
-            returns, mean_up, mean_z = eval_stats(theta, eval_keys)
-            ret = returns.mean()
-            print(f"\n[Iter {global_it+1}] Eval Return: {float(ret):.2f} | up: {float(mean_up):.3f} | z: {float(mean_z):.3f}")
+            returns, mean_up, mean_z, mean_knee = eval_stats(theta, eval_keys)
+            print(f"\n[Iter {global_it+1}] Eval Return: {returns.mean():.2f} | up: {mean_up:.3f} | z: {mean_z:.3f} | knee: {mean_knee:.3f}")
 
-        if (global_it + 1) % ckpt_every == 0 or it_local == total_new_iters - 1:
-            save_checkpoint(
-                kwargs["save_path"], theta=theta, key=key, it=global_it + 1,
-                obs_dim=obs_dim, act_dim=act_dim, meta={k: kwargs.get(k) for k in env_params_keys + ["xml_path"]},
-            )
+        if (global_it + 1) % kwargs["ckpt_every"] == 0 or it_local == kwargs["iterations"] - 1:
+            save_checkpoint(kwargs["save_path"], theta, key, global_it + 1, obs_dim, act_dim, meta={k: kwargs.get(k) for k in env_params_keys + ["xml_path"]})
 
 # ==============================================================================
 # 3. 추론
 # ==============================================================================
 def run_inference(xml_path: str, ckpt_path: str, **kwargs):
     ckpt = load_checkpoint(ckpt_path)
-    if ckpt is None:
-        raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+    if ckpt is None: raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
     theta, obs_dim, act_dim = ckpt["theta"], ckpt["obs_dim"], ckpt["act_dim"]
     _, policy_apply = make_policy_fns(obs_dim, act_dim)
 
     if ckpt.get("meta"):
-        for k, v in ckpt["meta"].items():
-            kwargs.setdefault(k, v)
+        for k, v in ckpt["meta"].items(): kwargs.setdefault(k, v)
 
     env_params_keys = [
         'action_repeat','z_threshold','ctrl_cost_weight','tilt_penalty_weight',
@@ -410,41 +407,47 @@ def run_inference(xml_path: str, ckpt_path: str, **kwargs):
         'stand_bonus','stand_shape_weight','speed_weight',
         'target_z_low','target_z_high','upright_min',
         'angvel_penalty_weight','act_delta_weight','base_vel_penalty_weight',
-        'streak_weight','streak_scale',
-        # [신규] 무릎 및 초기 자세 관련 인자 추가
+        'streak_weight','streak_scale','z_over_penalty',
         'knee_patterns','crouch_init_ratio','crouch_init_noise','init_pitch',
         'knee_band_low','knee_band_high','knee_band_weight','knee_over_penalty',
     ]
-    reset_batch, step_batch, _ = make_mjx_env(xml_path=xml_path, **{k: kwargs[k] for k in env_params_keys})
+    reset_batch, step_batch, info = make_mjx_env(xml_path=xml_path, **{k: kwargs[k] for k in env_params_keys})
+    knee_qadr, knee_min, knee_span = info["knee_qadr"], info["knee_min"], info["knee_span"]
 
-    num_envs = kwargs['num_envs']
-    episode_length = kwargs['episode_length']
-    keys = random.split(random.PRNGKey(kwargs['seed']), num_envs)
+    keys = random.split(random.PRNGKey(kwargs['seed']), kwargs['num_envs'])
 
     @jax.jit
     def eval_stats_once(theta_, keys_):
         state, obs = reset_batch(keys_)
         def body(carry, _):
-            st, ob, ret, sum_up, sum_z, alive_steps = carry
+            st, ob, ret, sum_up, sum_z, sum_knee, alive_steps = carry
             dd = st[0]
             qpos = dd.qpos
             z = qpos[:, 2].astype(jnp.float32)
             q = qpos[:, 3:7]
             up = jnp.clip(1.0 - 2.0 * (q[:, 1]**2 + q[:, 2]**2), 0.0, 1.0)
+            
+            knee_ratio_mean = jnp.float32(0.0)
+            if knee_qadr.shape[0] > 0:
+                kq = qpos[:, knee_qadr]
+                kr = jnp.clip((kq - knee_min) / knee_span, 0.0, 1.0)
+                knee_ratio_mean = jnp.mean(kr, axis=-1)
+
             act = policy_apply(theta_, ob)
             st2, (ob_next, r, done) = step_batch(st, act)
             is_alive = (1.0 - done)
-            return (st2, ob_next, ret + r*is_alive, sum_up + up*is_alive, sum_z + z*is_alive, alive_steps + is_alive), None
+            return (st2, ob_next, ret + r*is_alive, sum_up + up*is_alive, sum_z + z*is_alive, sum_knee + knee_ratio_mean*is_alive, alive_steps + is_alive), None
 
-        init = (state, obs, *[jnp.zeros(num_envs, jnp.float32) for _ in range(4)])
-        (_, _, returns, sum_up, sum_z, alive_steps), _ = lax.scan(body, init, None, length=episode_length)
+        init = (state, obs, *[jnp.zeros(kwargs['num_envs'], jnp.float32) for _ in range(5)])
+        (_, _, returns, sum_up, sum_z, sum_knee, alive_steps), _ = lax.scan(body, init, None, length=kwargs['episode_length'])
         total_alive_steps = jnp.maximum(jnp.sum(alive_steps), 1.0)
         mean_up = jnp.sum(sum_up) / total_alive_steps
         mean_z  = jnp.sum(sum_z)  / total_alive_steps
-        return returns.mean(), mean_up, mean_z
+        mean_knee = jnp.sum(sum_knee) / total_alive_steps
+        return returns.mean(), mean_up, mean_z, mean_knee
 
-    ret, up, z = eval_stats_once(theta, keys)
-    print(f"Inference mean return: {float(ret):.2f} | up: {float(up):.3f} | z: {float(z):.3f}")
+    ret, up, z, knee = eval_stats_once(theta, keys)
+    print(f"Inference mean return: {ret:.2f} | up: {up:.3f} | z: {z:.3f} | knee: {knee:.3f}")
 
 # ==============================================================================
 # 4. 스크립트 실행 메인 블록
@@ -482,8 +485,9 @@ def parse_args():
     p.add_argument("--forward-sign", type=int, choices=[-1, 1], default=-1)
     p.add_argument("--target-speed", type=float, default=0.35)
     p.add_argument("--overspeed-weight", type=float, default=1.2)
+    p.add_argument("--z-over-penalty", type=float, default=0.06, help="z 밴드(target_z_low/high) 밖 패널티 가중치")
 
-    # --- [신규] 초기 앉기 및 무릎 밴드 제어 인자 ---
+    # --- 초기 앉기 및 무릎 밴드 제어 인자 ---
     p.add_argument("--knee-patterns", type=str, default="knee", help="무릎 관절 이름 부분문자열(쉼표 구분). 예: knee,kneer")
     p.add_argument("--crouch-init-ratio", type=float, default=0.20, help="무릎 신장 비율 초기값(0=최소각,1=최대각). 깊게 앉기면 0.15~0.25")
     p.add_argument("--crouch-init-noise", type=float, default=0.03, help="초기 무릎 각도에 더할 잡음(관절 span 비율)")
