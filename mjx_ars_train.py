@@ -113,7 +113,7 @@ def make_mjx_env(xml_path: str, **kwargs):
     base_w = jnp.float32(kwargs.get('base_vel_penalty_weight', 0.02))
     st_w = jnp.float32(kwargs.get('streak_weight', 0.01))
     st_scale = jnp.float32(kwargs.get('streak_scale', 60.0))
-    z_pen_w = jnp.float32(kwargs.get('z_over_penalty', 0.06)) # [신규] z-밴드 패널티 가중치
+    z_pen_w = jnp.float32(kwargs.get('z_over_penalty', 0.06))
 
     # 초기 자세 및 무릎 관련 파라미터
     crouch_r = jnp.float32(kwargs.get('crouch_init_ratio', 0.20))
@@ -123,6 +123,11 @@ def make_mjx_env(xml_path: str, **kwargs):
     knee_hi  = jnp.float32(kwargs.get('knee_band_high', 0.70))
     knee_w   = jnp.float32(kwargs.get('knee_band_weight', 0.8))
     knee_pen = jnp.float32(kwargs.get('knee_over_penalty', 0.05))
+    # [신규] 과굴곡 패널티 및 중심 타겟 파라미터
+    knee_under_pen = jnp.float32(kwargs.get('knee_under_penalty', 0.18))
+    kcenter = jnp.float32(kwargs.get('knee_center', 0.60))
+    kcenter_w = jnp.float32(kwargs.get('knee_center_weight', 0.40))
+
 
     def scale_action(a_unit: jnp.ndarray) -> jnp.ndarray:
         return ctrl_center + ctrl_half * jnp.tanh(a_unit)
@@ -140,13 +145,11 @@ def make_mjx_env(xml_path: str, **kwargs):
         noise_all = 0.01 * random.normal(k1, (qpos0.shape[0],), dtype=jnp.float32)
         qpos = qpos0 + noise_all.at[:7].set(0.0)
 
-        # 무릎 관절을 지정된 앉은 자세로 강제 초기화
         if knee_qadr.shape[0] > 0:
             knee_noise = crouch_n * random.normal(k2, (knee_qadr.shape[0],), dtype=jnp.float32)
             knee_target = knee_min + crouch_r * knee_span + knee_noise * knee_span
             qpos = qpos.at[knee_qadr].set(knee_target)
 
-        # 몸통 pitch(y축 회전)를 적용하여 앞으로 숙인 자세로 초기화
         half = 0.5 * pitch0
         q_w, q_y = jnp.cos(half), jnp.sin(half)
         qpos = qpos.at[3:7].set(jnp.array([q_w, 0.0, q_y, 0.0], dtype=jnp.float32))
@@ -183,12 +186,10 @@ def make_mjx_env(xml_path: str, **kwargs):
         dd = lax.cond(done_prev, lambda d: d, integrate_if_alive, dd)
         obs = obs_from_dd(dd)
 
-        # --- 상태 변수 추출 ---
         base_z = dd.qpos[2].astype(jnp.float32)
         up = jnp.clip(upright_from_quat(dd.qpos[3:7]), 0.0, 1.0)
         forward_speed = (dd.qvel[fwd_idx] * fsign).astype(jnp.float32)
 
-        # --- 보상 요소 계산 ---
         z_band = band_parabola(base_z, z_lo, z_hi)
         up_band = band_parabola(up, up_min, 0.98)
         stand_shape = 0.5 * (z_band + up_band)
@@ -202,19 +203,21 @@ def make_mjx_env(xml_path: str, **kwargs):
         streak_next = jnp.where(is_standing_now, streak + 1.0, 0.0)
         streak_reward = st_w * jnp.tanh(streak_next / st_scale)
 
+        # [수정] 무릎 보상/패널티 계산 (과굴곡 패널티 강화 및 중심 타겟 추가)
         if knee_qadr.shape[0] > 0:
-            knee_q = dd.qpos[knee_qadr]
-            knee_ratio = jnp.clip((knee_q - knee_min) / knee_span, 0.0, 1.0)
-            knee_band_score = band_parabola(knee_ratio, knee_lo, knee_hi)
-            knee_band_mean = jnp.mean(knee_band_score)
-            under = jnp.clip(knee_lo - knee_ratio, 0.0, 1.0)
-            over  = jnp.clip(knee_ratio - knee_hi, 0.0, 1.0)
-            knee_out_pen = jnp.sum(under*under + over*over)
+            kq = dd.qpos[knee_qadr]
+            kr = jnp.clip((kq - knee_min) / knee_span, 0.0, 1.0)
+            kband = band_parabola(kr, knee_lo, knee_hi)
+            knee_band_mean = jnp.mean(kband)
+            under = jnp.clip(knee_lo - kr, 0.0, 1.0)
+            over  = jnp.clip(kr - knee_hi, 0.0, 1.0)
+            knee_out_pen = knee_under_pen * jnp.sum(under*under) + knee_pen * jnp.sum(over*over)
+            kcenter_term = -kcenter_w * jnp.mean((kr - kcenter)**2)
         else:
             knee_band_mean = jnp.float32(0.0)
             knee_out_pen   = jnp.float32(0.0)
+            kcenter_term   = jnp.float32(0.0)
 
-        # --- 패널티 요소 계산 ---
         ctrl_cost = ctrl_w * jnp.sum(jnp.square(ctrl))
         tilt_pen = tilt_w * (1.0 - up)
         ang_pen = ang_w * jnp.sum(jnp.square(dd.qvel[3:5].astype(jnp.float32)))
@@ -225,17 +228,16 @@ def make_mjx_env(xml_path: str, **kwargs):
         base_ang = dd.qvel[3:5].astype(jnp.float32)
         base_pen = base_w * (jnp.sum(jnp.square(lin_xy)) + jnp.sum(jnp.square(base_ang)))
 
-        # [신규] z-밴드 밖 패널티 (거리 제곱 기반)
         under_z = jnp.clip(z_lo - base_z, 0.0, 1e9)
         over_z  = jnp.clip(base_z - z_hi, 0.0, 1e9)
-        z_span = jnp.maximum(z_hi - z_lo, 1e-6) # 정규화
+        z_span = jnp.maximum(z_hi - z_lo, 1e-6)
         z_out_pen = (under_z / z_span)**2 + (over_z / z_span)**2
 
-        # --- 최종 보상 결합 ---
-        reward = (stand_b + stand_w * stand_shape + streak_reward + speed_term + knee_w * knee_band_mean
-                  - (tilt_pen + ang_pen + base_pen + act_pen + ctrl_cost + knee_pen * knee_out_pen + z_pen_w * z_out_pen))
+        # [수정] 최종 보상 결합
+        reward = (stand_b + stand_w * stand_shape + streak_reward + speed_term
+                  + knee_w * knee_band_mean + kcenter_term
+                  - (tilt_pen + ang_pen + base_pen + act_pen + ctrl_cost + knee_out_pen + z_pen_w * z_out_pen))
 
-        # --- 종료 조건 ---
         isnan = jnp.any(jnp.isnan(dd.qpos)) | jnp.any(jnp.isnan(dd.qvel))
         done_now = jnp.logical_or(isnan, jnp.logical_or(base_z < z_th, up < 0.2))
         done = jnp.logical_or(done_prev, done_now)
@@ -278,6 +280,7 @@ def ars_train(xml_path: str, **kwargs):
         'streak_weight','streak_scale','z_over_penalty',
         'knee_patterns','crouch_init_ratio','crouch_init_noise','init_pitch',
         'knee_band_low','knee_band_high','knee_band_weight','knee_over_penalty',
+        'knee_under_penalty', 'knee_center', 'knee_center_weight', # [신규]
     ]
     reset_batch, step_batch, info = make_mjx_env(xml_path=xml_path, **{k: kwargs[k] for k in env_params_keys})
     obs_dim, act_dim = info["obs_dim"], info["act_dim"]
@@ -410,6 +413,7 @@ def run_inference(xml_path: str, ckpt_path: str, **kwargs):
         'streak_weight','streak_scale','z_over_penalty',
         'knee_patterns','crouch_init_ratio','crouch_init_noise','init_pitch',
         'knee_band_low','knee_band_high','knee_band_weight','knee_over_penalty',
+        'knee_under_penalty', 'knee_center', 'knee_center_weight', # [신규]
     ]
     reset_batch, step_batch, info = make_mjx_env(xml_path=xml_path, **{k: kwargs[k] for k in env_params_keys})
     knee_qadr, knee_min, knee_span = info["knee_qadr"], info["knee_min"], info["knee_span"]
@@ -495,7 +499,10 @@ def parse_args():
     p.add_argument("--knee-band-low", type=float, default=0.50, help="무릎 신장 비율 하한(50%)")
     p.add_argument("--knee-band-high", type=float, default=0.70, help="무릎 신장 비율 상한(70%)")
     p.add_argument("--knee-band-weight", type=float, default=0.8, help="무릎 밴드 보상 가중치")
-    p.add_argument("--knee-over-penalty", type=float, default=0.05, help="무릎 밴드 밖(과신전/과굴곡) 패널티 가중치")
+    p.add_argument("--knee-over-penalty", type=float, default=0.05, help="무릎 밴드 밖(과신전) 패널티 가중치")
+    p.add_argument("--knee-under-penalty", type=float, default=0.18, help="무릎 밴드 하한(과굴곡) 패널티 가중치")
+    p.add_argument("--knee-center", type=float, default=0.60, help="무릎 비율 타겟(밴드 중심)")
+    p.add_argument("--knee-center-weight", type=float, default=0.40, help="타겟 중심으로 모으는 2차 셰이프 가중치")
 
     # --- 로깅 및 저장 ---
     p.add_argument("--eval-every", type=int, default=10)
