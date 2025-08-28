@@ -71,11 +71,19 @@ def train_phase2():
     print("이전 학습 결과에서 재개, 더 엄격한 조건으로")
     print("=" * 60)
     
+    import os
+    import shutil
+    
+    # Phase 1 체크포인트를 Phase 2로 복사 (첫 실행시)
+    if os.path.exists("ars_standing_phase1.npz") and not os.path.exists("ars_standing_phase2.npz"):
+        shutil.copy("ars_standing_phase1.npz", "ars_standing_phase2.npz")
+        print("Phase 1 체크포인트를 Phase 2로 복사했습니다.")
+    
     cmd = [
         "python", "mjx_ars_train.py",
         "--xml", "quadruped.xml",
         "--save-path", "ars_standing_phase2.npz",
-        "--resume",  # 이전 학습 재개
+        "--resume",  # 이전 학습 재개 (이제 phase2.npz를 이어서 학습)
         "--iterations", "400",
         "--num-envs", "256",
         "--num-dirs", "32",

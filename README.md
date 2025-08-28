@@ -123,6 +123,44 @@ python mjx_ars_train.py \
     --knee-band-high 0.65
 ```
 
+## 🔄 Resume Training
+
+### Continue from Checkpoint
+You can resume training from any checkpoint using `--resume`:
+
+```bash
+# Basic resume (continue for 100 more iterations)
+python mjx_ars_train.py --xml quadruped.xml \
+    --save-path my_policy.npz \
+    --iterations 100 \
+    --resume
+
+# Using resume helper script
+python resume_training.py ars_standing_phase1.npz --iterations 200
+
+# Check checkpoint info without training
+python resume_training.py ars_standing_phase1.npz --show-info
+
+# Resume with modified parameters
+python resume_training.py ars_standing_phase1.npz \
+    --iterations 100 \
+    --step-size 0.005 \
+    --noise-std 0.008
+```
+
+### Phase Transition
+```bash
+# After Phase 1 completes, Phase 2 automatically continues from it
+python train_standing.py phase2  # Automatically resumes from phase1.npz
+```
+
+### Resume Facts
+- ✅ Preserves network weights (theta)
+- ✅ Continues from exact iteration number
+- ✅ Maintains random seed state
+- ✅ Can override learning parameters
+- ✅ Saves progress incrementally (every 10 iterations by default)
+
 ## 🎮 Monitoring Training
 
 During training, observe these metrics:
