@@ -18,7 +18,6 @@ os.environ.update({
     'XLA_FLAGS': '--xla_gpu_autotune_level=3 --xla_gpu_enable_triton_gemm=true',
     'JAX_ENABLE_COMPILATION_CACHE': '1',
     'JAX_COMPILATION_CACHE_DIR': '/tmp/jax_cache_a100',
-    'MUJOCO_GL': 'egl',
     'CUDA_LAUNCH_BLOCKING': '0'
 })
 
@@ -33,7 +32,7 @@ import jax
 import jax.numpy as jnp
 from jax import random, lax
 from jax.flatten_util import ravel_pytree
-# No visualization needed for server training
+from tqdm import trange
 import mujoco
 from mujoco import mjx
 
@@ -297,7 +296,8 @@ def train(xml_path="quadruped.xml", save_path="a100_policy.npz", iterations=200,
         return jax.vmap(eval_one)(deltas, keys)
     
     # Training loop
-    for it_local in range(iterations):
+    pbar = trange(iterations, desc="Training")
+    for it_local in pbar:
         it = start_it + it_local
         
         # Generate random directions
@@ -323,8 +323,11 @@ def train(xml_path="quadruped.xml", save_path="a100_policy.npz", iterations=200,
         theta += step_size * grad
         
         # Display progress
-        if (it + 1) % 10 == 0:
-            print(f"[Iter {it+1}/{start_it + iterations}] Mean: {scores.mean():.2f}, Best: {scores.max():.2f}")
+        pbar.set_postfix({
+            "mean_reward": f"{scores.mean():.2f}",
+            "best": f"{scores.max():.2f}",
+            "std": f"{scores.std():.2f}"
+        })
         
         # Evaluation
         if (it + 1) % eval_every == 0:

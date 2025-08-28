@@ -17,7 +17,7 @@ source venv/bin/activate
 # Install packages
 pip install --upgrade pip
 pip install --upgrade "jax[cuda12_pip]" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
-pip install mujoco numpy
+pip install mujoco numpy tqdm
 
 # Test
 python -c "import jax; print('JAX devices:', jax.devices())"
