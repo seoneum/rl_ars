@@ -156,14 +156,42 @@ During training, observe these metrics:
 - **Parallelization**: Vectorized environments on GPU
 - **Policy**: Linear mapping from observations to actions
 
-## 📈 Expected Results
+## 📈 Expected Results & Success Criteria
 
-| Iterations | Expected Behavior |
-|------------|------------------|
-| 0-100      | Robot attempts to rise, often falls |
-| 100-300    | Begins to stand, wobbly balance |
-| 300-500    | Stable standing, minimal movement |
-| 500+       | Robust to small perturbations |
+### Training Progress by Phase
+
+| Phase | Iterations | Expected Behavior | Success Criteria (Avg Reward) |
+|-------|------------|------------------|------------------------------|
+| **Phase 1** | 0-100 | Robot attempts to rise, often falls | 15-25 points |
+| | 100-200 | Begins to stand briefly | 25-35 points |
+| | 200-300 | Can stand for short periods | **35-45 points** ✓ |
+| **Phase 2** | 300-400 | Stable standing, reduced wobbling | 45-55 points |
+| | 400-500 | Minimal movement, good balance | 55-65 points |
+| | 500-700 | Robust to perturbations | **65-75+ points** ✓ |
+
+### Success Metrics Breakdown
+
+**Phase 1 Success (~40 points):**
+- Base reward components:
+  - Stand bonus: 0.60
+  - Stand shape (z-height + upright): ~1.5
+  - Knee band reward: ~1.2
+  - Streak reward: ~0.2
+- Penalties (negative):
+  - Movement penalties: ~-0.5
+  - Control cost: ~-0.1
+- **Total**: ~35-45 points when successfully standing
+
+**Phase 2 Success (~70 points):**
+- Enhanced rewards:
+  - Stand bonus: 0.80
+  - Stand shape: ~2.4 (better posture)
+  - Knee band: ~1.8 (optimal range)
+  - Streak reward: ~0.8 (continuous standing)
+- Reduced penalties:
+  - Movement: ~-0.3 (more stable)
+  - Control: ~-0.05 (efficient)
+- **Total**: ~65-75 points for stable standing
 
 ## 🤝 Contributing
 
@@ -182,6 +210,117 @@ This project is part of reinforcement learning research for quadruped locomotion
 - [JAX Documentation](https://jax.readthedocs.io/)
 - [MuJoCo Documentation](https://mujoco.readthedocs.io/)
 - [ARS Paper](https://arxiv.org/abs/1803.07055)
+
+## 💻 Git Commands Reference
+
+### Initial Setup (First Time)
+```bash
+# Clone the repository
+git clone https://github.com/seoneum/rl_ars.git
+cd rl_ars
+
+# Check available branches
+git branch -a
+
+# Switch to standing-improvement branch
+git checkout standing-improvement
+
+# Set up git credentials (if not set)
+git config --global user.name "Your Name"
+git config --global user.email "your.email@example.com"
+```
+
+### Daily Workflow
+```bash
+# 1. Update your local repository (pull latest changes)
+git fetch origin
+git pull origin standing-improvement
+
+# 2. Check current status
+git status
+
+# 3. Make your changes, then save them
+git add .                          # Add all changes
+git add <specific_file>            # Add specific file
+git commit -m "Your message here"  # Commit with message
+
+# 4. Push changes to GitHub
+git push origin standing-improvement
+```
+
+### Working with Branches
+```bash
+# Create new branch from current
+git checkout -b new-feature-branch
+
+# Switch between branches
+git checkout standing-improvement
+git checkout main
+
+# Merge changes from another branch
+git checkout main
+git merge standing-improvement
+
+# Delete local branch
+git branch -d branch-name
+```
+
+### Common Git Operations
+```bash
+# View commit history
+git log --oneline -10              # Last 10 commits
+git log --graph --all --oneline    # Visual branch history
+
+# Undo changes (before commit)
+git checkout -- <file>              # Discard changes in file
+git reset HEAD <file>               # Unstage file
+
+# Undo last commit (keep changes)
+git reset --soft HEAD~1
+
+# Check differences
+git diff                            # Unstaged changes
+git diff --staged                   # Staged changes
+git diff HEAD~1                     # Changes from last commit
+
+# Stash changes temporarily
+git stash                          # Save current changes
+git stash pop                      # Restore stashed changes
+git stash list                     # List all stashes
+```
+
+### Syncing Fork (if you forked the repo)
+```bash
+# Add upstream remote (original repo)
+git remote add upstream https://github.com/seoneum/rl_ars.git
+
+# Fetch upstream changes
+git fetch upstream
+
+# Merge upstream changes to your fork
+git checkout standing-improvement
+git merge upstream/standing-improvement
+
+# Push updates to your fork
+git push origin standing-improvement
+```
+
+### Troubleshooting Git Issues
+```bash
+# Fix merge conflicts
+git status                         # See conflicted files
+# Edit files to resolve conflicts
+git add <resolved_files>
+git commit -m "Resolved merge conflicts"
+
+# Reset to remote state (CAREFUL: loses local changes)
+git fetch origin
+git reset --hard origin/standing-improvement
+
+# Clean untracked files
+git clean -n                       # Preview what will be deleted
+git clean -f                       # Actually delete untracked files
+```
 
 ---
 
