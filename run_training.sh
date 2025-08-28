@@ -30,18 +30,27 @@ if [ -z "$VIRTUAL_ENV" ]; then
   exit 1
 fi
 
-# Function to check for GPU availability
+# 기존 check_gpu() 함수를 삭제하고 아래 함수로 교체하세요.
 check_gpu() {
-  # Hide stderr to avoid clutter from JAX messages
-  python -c "import jax; gpus=jax.devices('gpu'); print(f'Found {len(gpus)} GPU(s)'); exit(0 if gpus else 1)" 2>/dev/null
+  # jax.devices('cuda')를 먼저 시도하고, 실패 시 플랫폼 이름으로 필터링합니다.
+  python - << 'PY' 2>/dev/null
+import sys, jax
+try:
+    gpus = jax.devices('cuda')
+except Exception:
+    gpus = [d for d in jax.devices() if d.platform == 'gpu']
+print(f'Found {len(gpus)} JAX GPU device(s)')
+sys.exit(0 if gpus else 1)
+PY
+  # Python 스크립트의 종료 코드를 확인하여 GPU 존재 여부를 판단합니다.
   if [ $? -ne 0 ]; then
     echo -e "${YELLOW}⚠️  No GPU detected by JAX. Training will be very slow.${NC}"
     read -p "Continue anyway? (y/n) " -r response
-    if [[ ! "$response" =~ ^[yY]$ ]]; then
-        exit 1
-    fi
+    # 'y' 또는 'Y'가 아니면 스크립트를 종료합니다.
+    [[ "$response" =~ ^[yY]$ ]] || exit 1
   fi
 }
+
 
 # Function to display training guidance
 monitor_training() {
@@ -129,3 +138,4 @@ case "${1:-phase1}" in
     exit 1
     ;;
 esac
+
