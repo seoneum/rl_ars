@@ -1,200 +1,187 @@
 #!/usr/bin/env python3
 """
 Installation verification script for Quadruped RL Training
-Checks all required dependencies and GPU support
+A100 80GB + JAX CUDA12 friendly:
+- nvcc 없는 환경도 OK (드라이버 + jax[cuda12_pip]이면 충분)
+- 실제 JAX GPU matmul 수행으로 가속 여부 판정
 """
 
 import sys
 import os
+import subprocess
 
 def check_python_version():
-    """Check Python version"""
-    version = sys.version_info
-    print(f"✓ Python version: {version.major}.{version.minor}.{version.micro}")
-    if version.major != 3 or version.minor != 11:
-        print(f"  ⚠️  Warning: Python 3.11 is recommended, you have {version.major}.{version.minor}")
-    return version.major == 3 and version.minor >= 10
-
-def check_cuda():
-    """Check CUDA availability"""
-    try:
-        import subprocess
-        result = subprocess.run(['nvcc', '--version'], capture_output=True, text=True)
-        if result.returncode == 0:
-            # Parse CUDA version from output
-            for line in result.stdout.split('\n'):
-                if 'release' in line:
-                    print(f"✓ CUDA: {line.strip()}")
-                    return True
-    except FileNotFoundError:
-        print("✗ CUDA: nvcc not found")
-        return False
-    return False
+    v = sys.version_info
+    print(f"✓ Python version: {v.major}.{v.minor}.{v.micro}")
+    if v.major != 3 or v.minor < 10:
+        print(f"  ⚠️  Warning: Python 3.10+ 권장 (현재 {v.major}.{v.minor})")
+    if v.minor != 11:
+        print("  ℹ️  Python 3.11 권장")
+    return True
 
 def check_nvidia_gpu():
-    """Check NVIDIA GPU availability"""
     try:
-        import subprocess
-        result = subprocess.run(['nvidia-smi'], capture_output=True, text=True)
+        result = subprocess.run(
+            ['nvidia-smi', '--query-gpu=name,memory.total,driver_version', '--format=csv,noheader'],
+            capture_output=True, text=True,
+        )
         if result.returncode == 0:
-            lines = result.stdout.split('\n')
-            for line in lines:
-                if 'NVIDIA' in line and 'Driver' in line:
-                    print(f"✓ GPU Driver: {line.strip()}")
+            lines = [l.strip() for l in result.stdout.splitlines() if l.strip()]
+            if lines:
+                name, mem, driver = [x.strip() for x in lines[0].split(',')]
+                print(f"✓ GPU: {name} | Memory: {mem} | Driver: {driver}")
+                return True
+    except FileNotFoundError:
+        print("⚠️  nvidia-smi not found (컨테이너/드라이버 확인 필요)")
+    return False
+
+def check_cuda_toolkit_optional():
+    # nvcc는 없어도 JAX GPU 가속 가능. 참고용으로만 출력.
+    try:
+        result = subprocess.run(['nvcc', '--version'], capture_output=True, text=True)
+        if result.returncode == 0:
+            for line in result.stdout.split('\n'):
+                if 'release' in line:
+                    print(f"✓ CUDA Toolkit: {line.strip()}")
                     return True
     except FileNotFoundError:
-        print("✗ GPU: nvidia-smi not found")
+        print("ℹ️  CUDA Toolkit (nvcc) 없음 - 필수 아님")
         return False
     return False
 
 def check_jax():
-    """Check JAX installation and GPU support"""
     try:
-        import jax
-        print(f"✓ JAX version: {jax.__version__}")
-        
+        import jax, jax.numpy as jnp
+        try:
+            import jaxlib
+            print(f"✓ JAX: {jax.__version__} | jaxlib: {jaxlib.__version__}")
+        except Exception:
+            print(f"✓ JAX: {jax.__version__}")
+
         devices = jax.devices()
-        print(f"  Available devices: {devices}")
-        
-        gpu_devices = [d for d in devices if d.device_kind != 'cpu']
-        if gpu_devices:
-            print(f"  ✓ GPU devices found: {len(gpu_devices)}")
-            
-            # Test GPU computation
-            try:
-                key = jax.random.PRNGKey(0)
-                x = jax.random.normal(key, (1000, 1000))
-                y = jax.numpy.dot(x, x.T)
-                y.block_until_ready()  # Ensure computation completes
-                print("  ✓ GPU computation test passed")
-                return True
-            except Exception as e:
-                print(f"  ✗ GPU computation failed: {e}")
-                return False
+        print(f"  Devices: {devices}")
+        has_gpu = any(d.platform == 'gpu' for d in devices)
+        if has_gpu:
+            # 실제 GPU에서 matmul 테스트
+            key = jax.random.PRNGKey(0)
+            x = jax.random.normal(key, (2048, 2048), dtype=jnp.float32)
+            y = x @ x.T
+            y.block_until_ready()
+            dev = y.device()
+            print(f"  ✓ GPU computation OK on {dev}")
+            return True, True
         else:
-            print("  ⚠️  No GPU devices found, will use CPU (slower)")
-            return True
+            print("  ⚠️  No GPU devices found by JAX (CPU fallback)")
+            return True, False
     except ImportError as e:
         print(f"✗ JAX not installed: {e}")
-        return False
+        return False, False
+    except Exception as e:
+        print(f"✗ JAX runtime error: {e}")
+        return False, False
 
 def check_mujoco():
-    """Check MuJoCo installation"""
     try:
         import mujoco
-        print(f"✓ MuJoCo version: {mujoco.__version__}")
-        
-        # Try to import mjx
+        print(f"✓ MuJoCo: {mujoco.__version__}")
+        # MJX 존재 여부
         try:
-            from mujoco import mjx
+            from mujoco import mjx  # noqa
             print("  ✓ MJX (JAX support) available")
-        except ImportError:
-            print("  ✗ MJX not available")
-        
-        # Test loading a simple model
+        except Exception:
+            print("  ℹ️  MJX not available (선택 사항)")
+
+        # XML 로딩 테스트
+        xml = "<mujoco><worldbody><body><geom type='sphere' size='0.1'/></body></worldbody></mujoco>"
+        model = mujoco.MjModel.from_xml_string(xml)
+        data = mujoco.MjData(model)
+        # 오프스크린 렌더(환경에 따라 EGL/OSMesa)
         try:
-            xml = """<mujoco><worldbody><body><geom type="sphere" size="0.1"/></body></worldbody></mujoco>"""
-            model = mujoco.MjModel.from_xml_string(xml)
-            print("  ✓ MuJoCo model loading test passed")
-            return True
+            renderer = mujoco.Renderer(model, 320, 240)
+            renderer.update_scene(data)
+            _ = renderer.render()
+            print("  ✓ Offscreen rendering OK")
         except Exception as e:
-            print(f"  ✗ MuJoCo model loading failed: {e}")
-            return False
+            print(f"  ℹ️  Rendering not tested: {e}")
+        return True
     except ImportError as e:
         print(f"✗ MuJoCo not installed: {e}")
         return False
+    except Exception as e:
+        print(f"✗ MuJoCo runtime error: {e}")
+        return False
 
 def check_other_dependencies():
-    """Check other required dependencies"""
-    dependencies = {
-        'numpy': 'NumPy',
-        'tqdm': 'tqdm',
-    }
-    
+    deps = ['numpy', 'tqdm', 'matplotlib', 'scipy']
     all_ok = True
-    for module, name in dependencies.items():
+    for mod in deps:
         try:
-            m = __import__(module)
-            version = getattr(m, '__version__', 'unknown')
-            print(f"✓ {name} version: {version}")
+            m = __import__(mod)
+            ver = getattr(m, '__version__', 'unknown')
+            print(f"✓ {mod} {ver}")
         except ImportError:
-            print(f"✗ {name} not installed")
+            print(f"✗ {mod} not installed")
             all_ok = False
-    
     return all_ok
 
 def check_project_files():
-    """Check if required project files exist"""
-    required_files = [
-        'quadruped.xml',
-        'mjx_ars_train.py',
-        'train_standing.py',
-    ]
-    
+    required = ['quadruped.xml', 'mjx_ars_train.py', 'train_standing.py']
     print("\n📁 Project files:")
     all_ok = True
-    for file in required_files:
-        if os.path.exists(file):
-            print(f"  ✓ {file}")
+    for f in required:
+        if os.path.exists(f):
+            print(f"  ✓ {f}")
         else:
-            print(f"  ✗ {file} not found")
+            print(f"  ✗ {f} not found")
             all_ok = False
-    
     return all_ok
 
 def main():
-    """Run all checks"""
     print("=" * 60)
     print("🔍 Quadruped RL Training - Installation Verification")
     print("=" * 60)
-    
+
     results = {}
-    
     print("\n🐍 Python Environment:")
     results['python'] = check_python_version()
-    
-    print("\n🎮 GPU Support:")
+
+    print("\n🎮 GPU / Driver:")
     results['nvidia'] = check_nvidia_gpu()
-    results['cuda'] = check_cuda()
-    
+    check_cuda_toolkit_optional()  # 참고용 출력
+
     print("\n📦 Core Dependencies:")
-    results['jax'] = check_jax()
+    results['jax_ok'], results['jax_gpu'] = check_jax()
     results['mujoco'] = check_mujoco()
     results['other'] = check_other_dependencies()
-    
     results['files'] = check_project_files()
-    
+
     print("\n" + "=" * 60)
     print("📊 Summary:")
     print("=" * 60)
-    
-    critical_ok = results['python'] and results['jax'] and results['mujoco'] and results['files']
-    gpu_ok = results['nvidia'] and results['cuda']
-    
+
+    critical_ok = results['python'] and results['jax_ok'] and results['mujoco'] and results['files']
+    gpu_ok = results['jax_gpu'] and results['nvidia']
+
     if critical_ok:
         if gpu_ok:
-            print("✅ All systems operational! GPU acceleration available.")
+            print("✅ All systems operational! JAX GPU acceleration available.")
             print("\n🚀 Ready to start training:")
-            print("   python train_standing.py phase1")
+            print("   python train_a100_optimized.py phase1")
         else:
-            print("⚠️  System operational but no GPU detected.")
-            print("   Training will work but be significantly slower.")
-            print("\n🚀 You can still start training:")
+            print("⚠️  System operational but GPU acceleration not confirmed.")
+            print("   - nvidia-smi/drivers 또는 JAX GPU 디바이스 확인 필요")
+            print("\n🚀 CPU로도 실행은 가능:")
             print("   python train_standing.py phase1")
     else:
-        print("❌ Some critical dependencies are missing.")
-        print("\n📚 Please follow the installation guide:")
-        print("   cat INSTALLATION.md")
-    
+        print("❌ Some critical dependencies are missing or invalid.")
+        print("\n📚 Please follow the installation guide or setup script:")
+        print("   bash setup_elice.sh")
+
     print("\n💡 Tips:")
     if not gpu_ok:
-        print("  - For GPU support, ensure CUDA 12 is installed")
-        print("  - Check nvidia-smi output")
-    if not results['jax']:
-        print("  - Install JAX with: uv pip install 'jax[cuda12_pip]' -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html")
-    if not results['mujoco']:
-        print("  - Install MuJoCo with: uv pip install mujoco")
-    
+        print("  - 드라이버 버전과 CUDA 런타임 호환 확인 (A100 + CUDA 12)")
+        print("  - JAX는 nvcc 없이도 GPU 사용 가능 (드라이버 필수)")
+        print("  - env.sh에서 MUJOCO_GL=egl 설정 권장(서버/헤드리스)")
     return 0 if critical_ok else 1
 
 if __name__ == "__main__":
