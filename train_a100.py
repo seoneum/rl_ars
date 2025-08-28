@@ -2,25 +2,37 @@
 """
 A100 Optimized Quadruped Standing Training
 All-in-one training script for NVIDIA A100 GPUs
+- No rendering/EGL dependencies (pure headless training)
+- JAX CUDA12 compatible environment
 """
 
-# ==============================================================================
-# 0. Environment Setup for A100
-# ==============================================================================
 import os
 
-# A100 Optimal Settings
-os.environ.update({
-    'JAX_PLATFORMS': 'gpu',
-    'JAX_ENABLE_X64': 'false',
-    'XLA_PYTHON_CLIENT_PREALLOCATE': 'false',
-    'XLA_PYTHON_CLIENT_MEM_FRACTION': '0.95',
-    'XLA_FLAGS': '--xla_gpu_autotune_level=3 --xla_gpu_enable_triton_gemm=true',
-    'JAX_ENABLE_COMPILATION_CACHE': '1',
-    'JAX_COMPILATION_CACHE_DIR': '/tmp/jax_cache_a100',
-    'CUDA_LAUNCH_BLOCKING': '0'
-})
+# ==============================================================================
+# 0. Environment Setup for A100 (before any JAX/MuJoCo import)
+# ==============================================================================
 
+# JAX: force CUDA backend with safe defaults
+os.environ['JAX_PLATFORMS'] = 'cuda'  # Force CUDA backend
+os.environ['JAX_ENABLE_X64'] = 'false'  # Use float32 for speed
+os.environ['JAX_ENABLE_COMPILATION_CACHE'] = '1'
+os.environ['JAX_COMPILATION_CACHE_DIR'] = os.path.expanduser('~/.cache/jax_a100')
+os.makedirs(os.environ['JAX_COMPILATION_CACHE_DIR'], exist_ok=True)
+
+# VRAM allocation policy (A100 optimized)
+os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'true'  # Preallocate for performance
+os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.92'  # Use 92% of GPU memory
+
+# Remove legacy XLA_FLAGS if present
+os.environ.pop('XLA_FLAGS', None)
+
+# CUDA settings
+os.environ['CUDA_LAUNCH_BLOCKING'] = '0'  # Async kernel launches
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '1'  # Reduce TF logging
+
+# ==============================================================================
+# Imports
+# ==============================================================================
 from jax import config
 config.update("jax_enable_x64", False)
 
@@ -246,6 +258,8 @@ def train(xml_path="quadruped.xml", save_path="a100_policy.npz", iterations=200,
     print(f"  Directions: {num_dirs}")
     print(f"  Episode Length: {episode_length}")
     print(f"  Iterations: {iterations}")
+    print(f"  JAX_PLATFORMS: {os.environ.get('JAX_PLATFORMS')}")
+    print(f"  XLA_PYTHON_CLIENT_MEM_FRACTION: {os.environ.get('XLA_PYTHON_CLIENT_MEM_FRACTION')}")
     print("=" * 60)
     
     # Create environment
@@ -359,7 +373,18 @@ def main():
     # Check GPU
     devices = jax.devices()
     print(f"JAX devices: {devices}")
-    if not any(d.device_kind == 'gpu' for d in devices):
+    
+    # Check if GPU is available
+    has_gpu = False
+    for d in devices:
+        if hasattr(d, 'platform'):
+            if d.platform in ('gpu', 'cuda'):
+                has_gpu = True
+        elif hasattr(d, 'device_kind'):
+            if d.device_kind == 'gpu':
+                has_gpu = True
+    
+    if not has_gpu:
         print("WARNING: No GPU detected! Training will be slow.")
         response = input("Continue anyway? (y/n): ")
         if response.lower() != 'y':
