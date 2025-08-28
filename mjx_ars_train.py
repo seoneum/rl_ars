@@ -95,38 +95,38 @@ def make_mjx_env(xml_path: str, **kwargs):
 
     # --- JIT 컴파일을 위한 파라미터 추출 및 캐스팅 ---
     action_repeat = int(kwargs.get('action_repeat', 3))
-    z_th = jnp.float32(kwargs.get('z_threshold', 0.32))
-    ctrl_w = jnp.float32(kwargs.get('ctrl_cost_weight', 2e-4))
-    tilt_w = jnp.float32(kwargs.get('tilt_penalty_weight', 3e-2))
+    z_th = jnp.float32(kwargs.get('z_threshold', 0.25))  # 낮은 높이 허용 (앉은 자세)
+    ctrl_w = jnp.float32(kwargs.get('ctrl_cost_weight', 1e-4))  # 컨트롤 비용 감소
+    tilt_w = jnp.float32(kwargs.get('tilt_penalty_weight', 5e-2))  # 기울기 패널티 증가
     fwd_idx = {"x": 0, "y": 1, "z": 2}[kwargs.get('forward_axis', 'x')]
     fsign = jnp.float32(kwargs.get('forward_sign', 1))
-    tgt_speed = jnp.float32(kwargs.get('target_speed', 0.35))
-    over_w = jnp.float32(kwargs.get('overspeed_weight', 1.2))
-    sp_w = jnp.float32(kwargs.get('speed_weight', 0.0))
-    stand_b = jnp.float32(kwargs.get('stand_bonus', 0.20))
-    stand_w = jnp.float32(kwargs.get('stand_shape_weight', 1.20))
-    z_lo = jnp.float32(kwargs.get('target_z_low', 0.50))
-    z_hi = jnp.float32(kwargs.get('target_z_high', 0.60))
-    up_min = jnp.float32(kwargs.get('upright_min', 0.75))
-    ang_w = jnp.float32(kwargs.get('angvel_penalty_weight', 0.01))
-    actdw = jnp.float32(kwargs.get('act_delta_weight', 1e-4))
-    base_w = jnp.float32(kwargs.get('base_vel_penalty_weight', 0.02))
-    st_w = jnp.float32(kwargs.get('streak_weight', 0.01))
-    st_scale = jnp.float32(kwargs.get('streak_scale', 60.0))
-    z_pen_w = jnp.float32(kwargs.get('z_over_penalty', 0.06))
+    tgt_speed = jnp.float32(kwargs.get('target_speed', 0.0))  # 속도 목표를 0으로 (제자리 서기)
+    over_w = jnp.float32(kwargs.get('overspeed_weight', 2.0))  # 과속 패널티 증가
+    sp_w = jnp.float32(kwargs.get('speed_weight', 0.0))  # 속도 보상 비활성화
+    stand_b = jnp.float32(kwargs.get('stand_bonus', 0.50))  # 서기 보너스 증가
+    stand_w = jnp.float32(kwargs.get('stand_shape_weight', 2.0))  # 서기 형태 가중치 증가
+    z_lo = jnp.float32(kwargs.get('target_z_low', 0.45))  # 목표 높이 조정
+    z_hi = jnp.float32(kwargs.get('target_z_high', 0.55))
+    up_min = jnp.float32(kwargs.get('upright_min', 0.85))  # 더 엄격한 수직성 요구
+    ang_w = jnp.float32(kwargs.get('angvel_penalty_weight', 0.05))  # 각속도 패널티 증가
+    actdw = jnp.float32(kwargs.get('act_delta_weight', 5e-4))  # 액션 변화 패널티 증가
+    base_w = jnp.float32(kwargs.get('base_vel_penalty_weight', 0.08))  # 베이스 속도 패널티 증가
+    st_w = jnp.float32(kwargs.get('streak_weight', 0.05))  # 연속 서기 보상 증가
+    st_scale = jnp.float32(kwargs.get('streak_scale', 30.0))  # 연속 서기 스케일 조정
+    z_pen_w = jnp.float32(kwargs.get('z_over_penalty', 0.10))  # 높이 범위 이탈 패널티 증가
 
     # 초기 자세 및 무릎 관련 파라미터
-    crouch_r = jnp.float32(kwargs.get('crouch_init_ratio', 0.20))
-    crouch_n = jnp.float32(kwargs.get('crouch_init_noise', 0.03))
-    pitch0   = jnp.float32(kwargs.get('init_pitch', -0.12))
+    crouch_r = jnp.float32(kwargs.get('crouch_init_ratio', 0.80))  # 앉은 자세에서 시작 (80% 굴곡)
+    crouch_n = jnp.float32(kwargs.get('crouch_init_noise', 0.02))
+    pitch0   = jnp.float32(kwargs.get('init_pitch', -0.08))  # 약간 앞으로 기울임
     knee_lo  = jnp.float32(kwargs.get('knee_band_low', 0.50))
     knee_hi  = jnp.float32(kwargs.get('knee_band_high', 0.70))
-    knee_w   = jnp.float32(kwargs.get('knee_band_weight', 0.8))
-    knee_pen = jnp.float32(kwargs.get('knee_over_penalty', 0.05))
+    knee_w   = jnp.float32(kwargs.get('knee_band_weight', 1.5))  # 무릎 밴드 보상 증가
+    knee_pen = jnp.float32(kwargs.get('knee_over_penalty', 0.10))  # 과신전 패널티 증가
     # [신규] 과굴곡 패널티 및 중심 타겟 파라미터
-    knee_under_pen = jnp.float32(kwargs.get('knee_under_penalty', 0.18))
+    knee_under_pen = jnp.float32(kwargs.get('knee_under_penalty', 0.05))  # 과굴곡 패널티 감소 (앉은 자세에서 시작하므로)
     kcenter = jnp.float32(kwargs.get('knee_center', 0.60))
-    kcenter_w = jnp.float32(kwargs.get('knee_center_weight', 0.40))
+    kcenter_w = jnp.float32(kwargs.get('knee_center_weight', 0.60))  # 중심 타겟 가중치 증가
 
 
     def scale_action(a_unit: jnp.ndarray) -> jnp.ndarray:
@@ -195,9 +195,9 @@ def make_mjx_env(xml_path: str, **kwargs):
         stand_shape = 0.5 * (z_band + up_band)
         stand_gate_soft = between_gate(base_z, z_lo, z_hi) * sgate(up, up_min)
 
-        reward_forward = jnp.minimum(forward_speed, tgt_speed)
-        overspeed = jnp.maximum(forward_speed - tgt_speed, 0.0)
-        speed_term = sp_w * stand_gate_soft * (reward_forward - over_w * (overspeed**2))
+        # 속도 관련 항목을 패널티로만 변경 (제자리 서기 목표)
+        speed_penalty = over_w * (forward_speed**2)  # 모든 움직임을 패널티로
+        speed_term = -speed_penalty * stand_gate_soft  # 서 있을 때만 적용
 
         is_standing_now = (stand_gate_soft > 0.6) & (~done_prev)
         streak_next = jnp.where(is_standing_now, streak + 1.0, 0.0)
@@ -233,13 +233,16 @@ def make_mjx_env(xml_path: str, **kwargs):
         z_span = jnp.maximum(z_hi - z_lo, 1e-6)
         z_out_pen = (under_z / z_span)**2 + (over_z / z_span)**2
 
-        # [수정] 최종 보상 결합
-        reward = (stand_b + stand_w * stand_shape + streak_reward + speed_term
-                  + knee_w * knee_band_mean + kcenter_term
-                  - (tilt_pen + ang_pen + base_pen + act_pen + ctrl_cost + knee_out_pen + z_pen_w * z_out_pen))
+        # [수정] 최종 보상 결합 - 서기와 밸런스에 집중
+        # 서기 관련 보상을 크게 증가시키고, 움직임 관련 패널티 강화
+        stand_reward = stand_b + stand_w * stand_shape + streak_reward
+        knee_reward = knee_w * knee_band_mean + kcenter_term
+        penalty = (tilt_pen + ang_pen + base_pen + act_pen + ctrl_cost + knee_out_pen + z_pen_w * z_out_pen)
+        
+        reward = stand_reward + knee_reward + speed_term - penalty
 
         isnan = jnp.any(jnp.isnan(dd.qpos)) | jnp.any(jnp.isnan(dd.qvel))
-        done_now = jnp.logical_or(isnan, jnp.logical_or(base_z < z_th, up < 0.2))
+        done_now = jnp.logical_or(isnan, jnp.logical_or(base_z < z_th, up < 0.15))  # 더 관대한 종료 조건
         done = jnp.logical_or(done_prev, done_now)
 
         new_state = (dd, obs, done, ctrl, streak_next)
@@ -471,38 +474,38 @@ def parse_args():
     p.add_argument("--dir-chunk", type=int, default=8)
     p.add_argument("--step-size", type=float, default=0.010)
     p.add_argument("--noise-std", type=float, default=0.015)
-    p.add_argument("--z-threshold", type=float, default=0.32)
-    p.add_argument("--ctrl-cost-weight", type=float, default=2e-4)
-    p.add_argument("--tilt-penalty-weight", type=float, default=3e-2)
-    p.add_argument("--stand-bonus", type=float, default=0.20)
-    p.add_argument("--stand-shape-weight", type=float, default=1.20)
+    p.add_argument("--z-threshold", type=float, default=0.25)  # 낮은 종료 높이
+    p.add_argument("--ctrl-cost-weight", type=float, default=1e-4)
+    p.add_argument("--tilt-penalty-weight", type=float, default=5e-2)
+    p.add_argument("--stand-bonus", type=float, default=0.50)
+    p.add_argument("--stand-shape-weight", type=float, default=2.0)
     p.add_argument("--speed-weight", type=float, default=0.0)
-    p.add_argument("--target-z-low", type=float, default=0.50)
-    p.add_argument("--target-z-high", type=float, default=0.60)
-    p.add_argument("--upright-min", type=float, default=0.75)
-    p.add_argument("--angvel-penalty-weight", type=float, default=0.01)
-    p.add_argument("--act-delta-weight", type=float, default=1e-4)
-    p.add_argument("--base-vel-penalty-weight", type=float, default=0.02)
-    p.add_argument("--streak-weight", type=float, default=0.01)
-    p.add_argument("--streak-scale", type=float, default=60.0)
+    p.add_argument("--target-z-low", type=float, default=0.45)
+    p.add_argument("--target-z-high", type=float, default=0.55)
+    p.add_argument("--upright-min", type=float, default=0.85)
+    p.add_argument("--angvel-penalty-weight", type=float, default=0.05)
+    p.add_argument("--act-delta-weight", type=float, default=5e-4)
+    p.add_argument("--base-vel-penalty-weight", type=float, default=0.08)
+    p.add_argument("--streak-weight", type=float, default=0.05)
+    p.add_argument("--streak-scale", type=float, default=30.0)
     p.add_argument("--forward-axis", choices=["x", "y", "z"], default="x")
     p.add_argument("--forward-sign", type=int, choices=[-1, 1], default=-1)
-    p.add_argument("--target-speed", type=float, default=0.35)
-    p.add_argument("--overspeed-weight", type=float, default=1.2)
-    p.add_argument("--z-over-penalty", type=float, default=0.06, help="z 밴드(target_z_low/high) 밖 패널티 가중치")
+    p.add_argument("--target-speed", type=float, default=0.0)  # 제자리 서기 목표
+    p.add_argument("--overspeed-weight", type=float, default=2.0)
+    p.add_argument("--z-over-penalty", type=float, default=0.10, help="z 밴드(target_z_low/high) 밖 패널티 가중치")
 
     # --- 초기 앉기 및 무릎 밴드 제어 인자 ---
     p.add_argument("--knee-patterns", type=str, default="knee", help="무릎 관절 이름 부분문자열(쉼표 구분). 예: knee,kneer")
-    p.add_argument("--crouch-init-ratio", type=float, default=0.20, help="무릎 신장 비율 초기값(0=최소각,1=최대각). 깊게 앉기면 0.15~0.25")
-    p.add_argument("--crouch-init-noise", type=float, default=0.03, help="초기 무릎 각도에 더할 잡음(관절 span 비율)")
-    p.add_argument("--init-pitch", type=float, default=-0.12, help="초기 몸통 pitch(rad, y축 회전). 앞쪽으로 약간 숙임")
+    p.add_argument("--crouch-init-ratio", type=float, default=0.80, help="무릎 신장 비율 초기값(0=최소각,1=최대각). 앉아있는 자세에서 시작")
+    p.add_argument("--crouch-init-noise", type=float, default=0.02, help="초기 무릎 각도에 더할 잡음(관절 span 비율)")
+    p.add_argument("--init-pitch", type=float, default=-0.08, help="초기 몸통 pitch(rad, y축 회전). 앞쪽으로 약간 숙임")
     p.add_argument("--knee-band-low", type=float, default=0.50, help="무릎 신장 비율 하한(50%)")
     p.add_argument("--knee-band-high", type=float, default=0.70, help="무릎 신장 비율 상한(70%)")
-    p.add_argument("--knee-band-weight", type=float, default=0.8, help="무릎 밴드 보상 가중치")
-    p.add_argument("--knee-over-penalty", type=float, default=0.05, help="무릎 밴드 밖(과신전) 패널티 가중치")
-    p.add_argument("--knee-under-penalty", type=float, default=0.18, help="무릎 밴드 하한(과굴곡) 패널티 가중치")
+    p.add_argument("--knee-band-weight", type=float, default=1.5, help="무릎 밴드 보상 가중치")
+    p.add_argument("--knee-over-penalty", type=float, default=0.10, help="무릎 밴드 밖(과신전) 패널티 가중치")
+    p.add_argument("--knee-under-penalty", type=float, default=0.05, help="무릎 밴드 하한(과굴곡) 패널티 가중치")
     p.add_argument("--knee-center", type=float, default=0.60, help="무릎 비율 타겟(밴드 중심)")
-    p.add_argument("--knee-center-weight", type=float, default=0.40, help="타겟 중심으로 모으는 2차 셰이프 가중치")
+    p.add_argument("--knee-center-weight", type=float, default=0.60, help="타겟 중심으로 모으는 2차 셰이프 가중치")
 
     # --- 로깅 및 저장 ---
     p.add_argument("--eval-every", type=int, default=10)
